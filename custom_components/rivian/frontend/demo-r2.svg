@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 200" role="img" aria-label="Generic electric SUV illustration">
+  <title>Generic electric SUV (illustration)</title>
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4aa58f"/>
+      <stop offset="1" stop-color="#2a7565"/>
+    </linearGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#e3f1f7"/>
+      <stop offset="1" stop-color="#a9c9d8"/>
+    </linearGradient>
+  </defs>
+  <ellipse cx="200" cy="172" rx="172" ry="7" fill="#000" opacity="0.16"/>
+  <path fill="url(#body)" d="M32 142 L32 98 Q32 80 46 62 Q54 48 76 46 L238 46 Q262 48 276 76 L346 98 Q366 102 368 118 L368 142 L335 142 A35 35 0 0 0 265 142 L140 142 A35 35 0 0 0 70 142 Z"/>
+  <path fill="none" stroke="#1f5a4d" stroke-width="2" stroke-linejoin="round" d="M32 142 L32 98 Q32 80 46 62 Q54 48 76 46 L238 46 Q262 48 276 76 L346 98 Q366 102 368 118 L368 142"/>
+  <path fill="url(#glass)" d="M62 80 Q66 58 86 54 L180 54 L180 80 Z"/>
+  <path fill="url(#glass)" d="M188 54 L236 54 Q252 57 263 80 L188 80 Z"/>
+  <path fill="none" stroke="#1f5a4d" stroke-width="2" d="M184 48 L184 142"/>
+  <path fill="none" stroke="#7fc2b0" stroke-width="2" stroke-linecap="round" opacity="0.7" d="M50 108 L340 112"/>
+  <rect x="160" y="100" width="16" height="4" rx="2" fill="#1f5a4d"/>
+  <rect x="204" y="100" width="16" height="4" rx="2" fill="#1f5a4d"/>
+  <rect x="352" y="104" width="14" height="6" rx="3" fill="#fff6c9"/>
+  <rect x="33" y="104" width="8" height="12" rx="3" fill="#d9534f"/>
+  <path fill="#1d2226" d="M340 132 L368 132 L368 142 L346 142 Z" opacity="0.55"/>
+  <g transform="translate(105 142)">
+    <circle r="29" fill="#1d2226"/>
+    <circle r="17" fill="#d5dbe0"/>
+    <circle r="17" fill="none" stroke="#9aa5ad" stroke-width="2"/>
+    <g stroke="#9aa5ad" stroke-width="3" stroke-linecap="round">
+      <line x1="0" y1="-13" x2="0" y2="13"/><line x1="-13" y1="0" x2="13" y2="0"/>
+      <line x1="-9.2" y1="-9.2" x2="9.2" y2="9.2"/><line x1="-9.2" y1="9.2" x2="9.2" y2="-9.2"/>
+    </g>
+    <circle r="4.5" fill="#6b7780"/>
+  </g>
+  <g transform="translate(300 142)">
+    <circle r="29" fill="#1d2226"/>
+    <circle r="17" fill="#d5dbe0"/>
+    <circle r="17" fill="none" stroke="#9aa5ad" stroke-width="2"/>
+    <g stroke="#9aa5ad" stroke-width="3" stroke-linecap="round">
+      <line x1="0" y1="-13" x2="0" y2="13"/><line x1="-13" y1="0" x2="13" y2="0"/>
+      <line x1="-9.2" y1="-9.2" x2="9.2" y2="9.2"/><line x1="-9.2" y1="9.2" x2="9.2" y2="-9.2"/>
+    </g>
+    <circle r="4.5" fill="#6b7780"/>
+  </g>
+</svg>

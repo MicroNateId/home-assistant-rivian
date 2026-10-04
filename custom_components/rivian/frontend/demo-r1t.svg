@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 200" role="img" aria-label="Generic electric pickup truck illustration">
+  <title>Generic electric pickup truck (illustration)</title>
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4f86bd"/>
+      <stop offset="1" stop-color="#2f5f93"/>
+    </linearGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#e3f1f7"/>
+      <stop offset="1" stop-color="#a9c9d8"/>
+    </linearGradient>
+  </defs>
+  <ellipse cx="200" cy="174" rx="178" ry="7" fill="#000" opacity="0.16"/>
+  <!-- Open bed: the rear wall, the inner floor seen over the side, and the side panel. -->
+  <path fill="#244a73" d="M22 84 L170 84 L170 92 L22 92 Z"/>
+  <path fill="#1b2f45" d="M30 92 L166 92 L166 98 L30 98 Z" opacity="0.85"/>
+  <!-- Body: bed side, tall boxy cab with a near-vertical windshield, short flat hood. -->
+  <path fill="url(#body)" d="M22 84 L22 134 L60 134 A38 38 0 0 1 136 134 L264 134 A38 38 0 0 1 340 134 L376 134 L376 104 Q374 94 362 92 L304 88 L284 52 Q280 46 272 46 L182 46 Q176 46 174 52 L170 84 Z"/>
+  <path fill="none" stroke="#244a73" stroke-width="2" stroke-linejoin="round" d="M22 84 L22 134 M376 134 L376 104 Q374 94 362 92 L304 88 L284 52 Q280 46 272 46 L182 46 Q176 46 174 52 L170 84 L22 84"/>
+  <!-- Bed rail cap and tailgate seam. -->
+  <rect x="20" y="81" width="152" height="5" rx="2" fill="#7fa8d2"/>
+  <path fill="none" stroke="#244a73" stroke-width="2" d="M30 88 L30 132"/>
+  <!-- Windows: rear cab window and the door glass. -->
+  <path fill="url(#glass)" d="M182 54 L226 54 L226 86 L178 86 Z"/>
+  <path fill="url(#glass)" d="M232 54 L272 54 Q276 54 278 58 L294 86 L232 86 Z"/>
+  <path fill="none" stroke="#244a73" stroke-width="2" d="M229 50 L229 134"/>
+  <!-- Belt line, door handles, lights, bumper. -->
+  <path fill="none" stroke="#8fb6dc" stroke-width="2" stroke-linecap="round" opacity="0.7" d="M28 108 L370 110"/>
+  <rect x="204" y="96" width="16" height="4" rx="2" fill="#244a73"/>
+  <rect x="244" y="96" width="16" height="4" rx="2" fill="#244a73"/>
+  <rect x="356" y="96" width="20" height="5" rx="2.5" fill="#fff6c9"/>
+  <rect x="22" y="94" width="6" height="16" rx="3" fill="#d9534f"/>
+  <path fill="#1d2226" d="M346 124 L378 124 L378 136 L352 136 Z" opacity="0.55"/>
+  <path fill="#1d2226" d="M18 124 L40 124 L40 136 L18 136 Z" opacity="0.55"/>
+  <g transform="translate(98 138)">
+    <circle r="32" fill="#1d2226"/>
+    <circle r="18" fill="#d5dbe0"/>
+    <circle r="18" fill="none" stroke="#9aa5ad" stroke-width="2"/>
+    <g stroke="#9aa5ad" stroke-width="3" stroke-linecap="round">
+      <line x1="0" y1="-14" x2="0" y2="14"/><line x1="-14" y1="0" x2="14" y2="0"/>
+      <line x1="-9.9" y1="-9.9" x2="9.9" y2="9.9"/><line x1="-9.9" y1="9.9" x2="9.9" y2="-9.9"/>
+    </g>
+    <circle r="5" fill="#6b7780"/>
+  </g>
+  <g transform="translate(302 138)">
+    <circle r="32" fill="#1d2226"/>
+    <circle r="18" fill="#d5dbe0"/>
+    <circle r="18" fill="none" stroke="#9aa5ad" stroke-width="2"/>
+    <g stroke="#9aa5ad" stroke-width="3" stroke-linecap="round">
+      <line x1="0" y1="-14" x2="0" y2="14"/><line x1="-14" y1="0" x2="14" y2="0"/>
+      <line x1="-9.9" y1="-9.9" x2="9.9" y2="9.9"/><line x1="-9.9" y1="9.9" x2="9.9" y2="-9.9"/>
+    </g>
+    <circle r="5" fill="#6b7780"/>
+  </g>
+</svg>
