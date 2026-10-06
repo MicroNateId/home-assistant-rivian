@@ -69,6 +69,24 @@ _CONTEXT_ENTITY_UNIQUE_ID_KEYS: Final[dict[str, tuple[str, str]]] = {
     "trailer_status": ("sensor", "trailer_status"),
     "driver": ("sensor", "active_driver"),
 }
+# Every key drive reconstruction reads. Resolving these through the entity
+# registry matters: the fuzzy matcher can't tell the car's "speed" sensor from
+# another integration's (a speed test, a phone) because entity_ids never
+# contain the VIN.
+_DRIVE_ENTITY_UNIQUE_ID_KEYS: Final[dict[str, tuple[str, str]]] = {
+    "gear_selector": ("sensor", "gear_status"),
+    "battery_capacity": ("sensor", "battery_capacity"),
+    "charging_status": ("binary_sensor", "charger_state"),
+    **_TRACK_ENTITY_UNIQUE_ID_KEYS,
+    **_CONTEXT_ENTITY_UNIQUE_ID_KEYS,
+}
+# What reconstruct_drives_from_sqlite resolves: the registry-backed keys plus
+# separate latitude/longitude sensors, which only the fuzzy matcher can find.
+_DRIVE_ENTITY_KEYS: Final[tuple[str, ...]] = (
+    *_DRIVE_ENTITY_UNIQUE_ID_KEYS,
+    "latitude",
+    "longitude",
+)
 DRIVING_GEARS: Final[frozenset[str]] = frozenset({"drive", "reverse", "d", "r"})
 PARK_GEAR: Final[frozenset[str]] = frozenset({"park", "p"})
 NON_DRIVING_GEARS: Final[frozenset[str]] = frozenset(
@@ -105,6 +123,22 @@ def _get_speed_bin_key(speed_mph: float) -> str:
     return f"{bin_lower}-{bin_lower + 9}"
 
 
+def _entity_name_hint(entity_ids: Any) -> str | None:
+    """Return the object_id prefix the vehicle's own entities share, e.g. ``"r1s_"``.
+
+    Taken from registry-resolved entity_ids (``sensor.r1s_speed``,
+    ``device_tracker.r1s_location`` -> ``"r1s_"``), so the fuzzy matcher can
+    prefer this car's entities over look-alikes. ``None`` with fewer than two
+    ids or no shared ``_``-terminated prefix.
+    """
+    object_ids = [eid.split(".", 1)[1] for eid in entity_ids or () if "." in eid]
+    if len(object_ids) < 2:
+        return None
+    prefix = os.path.commonprefix(object_ids)
+    cut = prefix.rfind("_")
+    return prefix[: cut + 1].lower() if cut > 0 else None
+
+
 def _find_tracker_id(
     entity_map: dict[str, int], target_tokens: list[str]
 ) -> int | None:
@@ -137,8 +171,13 @@ def resolve_recorder_entities(
     conn: sqlite3.Connection,
     vin: str | None = None,
     vehicle_id: str | None = None,
+    name_hint: str | None = None,
 ) -> dict[str, int]:
-    """Resolve metadata IDs for vehicle entities in Home Assistant recorder schema."""
+    """Resolve metadata IDs for vehicle entities in Home Assistant recorder schema.
+
+    ``name_hint`` (see ``_entity_name_hint``) limits the search to entities
+    whose object_id starts with it, when the recorder holds any.
+    """
     cursor = conn.cursor()
 
     # Check if states_meta exists (HA schema >= 30)
@@ -162,6 +201,15 @@ def resolve_recorder_entities(
             cursor.execute("SELECT DISTINCT entity_id FROM states")
             for idx, row in enumerate(cursor.fetchall(), start=1):
                 entity_map[row["entity_id"].lower()] = idx
+
+    if name_hint:
+        hinted = {
+            eid: mid
+            for eid, mid in entity_map.items()
+            if eid.split(".", 1)[-1].startswith(name_hint.lower())
+        }
+        if hinted:
+            entity_map = hinted
 
     resolved: dict[str, int] = {}
     target_tokens = []
@@ -475,18 +523,35 @@ async def async_resolve_vehicle_entity_ids(
     `reconstruct_tracks_for_windows`) for any key not found here, e.g. in
     tests that build a recorder DB without a matching entity registry.
     """
+    return _async_resolve_registry_ids(hass, vin, _TRACK_ENTITY_UNIQUE_ID_KEYS)
+
+
+async def async_resolve_drive_entity_ids(
+    hass: HomeAssistant, vin: str
+) -> dict[str, str]:
+    """Resolve every entity drive reconstruction reads via the entity registry.
+
+    Covers gear, odometer, SoC, speed, altitude, location, capacity, charging
+    and the vehicle-context fields; ``reconstruct_drives_from_sqlite`` only
+    falls back to fuzzy matching for keys missing here.
+    """
+    return _async_resolve_registry_ids(hass, vin, _DRIVE_ENTITY_UNIQUE_ID_KEYS)
+
+
+def _async_resolve_registry_ids(
+    hass: HomeAssistant, vin: str, keys: dict[str, tuple[str, str]]
+) -> dict[str, str]:
+    """Map each ``key`` to this VIN's entity_id via its (domain, unique_id)."""
     try:
         registry = er.async_get(hass)
     except (AttributeError, TypeError, KeyError) as err:
         # No real entity registry available (e.g. a hand-rolled mock hass in
-        # tests). reconstruct_tracks_for_windows falls back to fuzzy matching.
-        _LOGGER.debug(
-            "Entity registry unavailable for track entity resolution: %s", err
-        )
+        # tests). The reconstruct_* functions fall back to fuzzy matching.
+        _LOGGER.debug("Entity registry unavailable for entity resolution: %s", err)
         return {}
 
     resolved: dict[str, str] = {}
-    for key, (domain, key_suffix) in _TRACK_ENTITY_UNIQUE_ID_KEYS.items():
+    for key, (domain, key_suffix) in keys.items():
         try:
             entity_id = registry.async_get_entity_id(
                 domain, DOMAIN, f"{vin}-{key_suffix}"
@@ -498,64 +563,80 @@ async def async_resolve_vehicle_entity_ids(
     return resolved
 
 
-async def async_resolve_context_entity_ids(
-    hass: HomeAssistant, vin: str
-) -> dict[str, str]:
-    """Resolve this VIN's vehicle-context entity_ids via the entity registry.
-
-    Mirrors ``async_resolve_vehicle_entity_ids`` but for the live-context
-    fields (range, drive mode, trailer, driver) rather than the ones a GPS
-    track needs. Falls back to the fuzzy ``resolve_recorder_entities``
-    matcher (used automatically by ``reconstruct_drives_from_sqlite``) for
-    any key not found here.
-    """
-    try:
-        registry = er.async_get(hass)
-    except (AttributeError, TypeError, KeyError) as err:
-        _LOGGER.debug(
-            "Entity registry unavailable for context entity resolution: %s", err
-        )
-        return {}
-
-    resolved: dict[str, str] = {}
-    for key, (domain, key_suffix) in _CONTEXT_ENTITY_UNIQUE_ID_KEYS.items():
-        try:
-            entity_id = registry.async_get_entity_id(
-                domain, DOMAIN, f"{vin}-{key_suffix}"
-            )
-        except (AttributeError, TypeError, KeyError):
-            continue
-        if entity_id:
-            resolved[key] = entity_id
-    return resolved
-
-
-def _resolve_metadata_ids_from_entity_ids(
-    conn: sqlite3.Connection, entity_ids: dict[str, str]
+def _resolve_backfill_entities(
+    conn: sqlite3.Connection,
+    entity_ids: dict[str, str] | None,
+    keys: tuple[str, ...],
+    vin: str | None,
+    vehicle_id: str | None,
 ) -> dict[str, int]:
-    """Map {key: entity_id} to {key: metadata_id} via the recorder's states_meta.
+    """Map ``keys`` to recorder metadata ids: registry entity_ids first, then guesses.
 
-    Returns an empty dict if there is nothing to resolve or the recorder
-    schema predates ``states_meta`` (an older schema has no stable id to look
-    entity_ids up by here; the fuzzy matcher is the only option there).
+    ``entity_ids`` comes from the entity registry (``async_resolve_*``). A key
+    it doesn't cover, or whose entity_id has no recorder history (renamed, or
+    a database copied from another install), falls back to the fuzzy
+    ``resolve_recorder_entities``, limited to entities named like this car's
+    own (``_entity_name_hint``). Once the registry gives the location
+    tracker, latitude/longitude sensors are never guessed, since another
+    integration's would replace the car's position. Logs the entity used
+    for each key so a bad backfill can be traced.
     """
-    if not entity_ids:
-        return {}
+    entity_ids = entity_ids or {}
     cursor = conn.cursor()
     cursor.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='states_meta'"
     )
-    if cursor.fetchone() is None:
-        return {}
-    cursor.execute("SELECT metadata_id, entity_id FROM states_meta")
-    meta_by_entity_id = {
-        row["entity_id"]: row["metadata_id"] for row in cursor.fetchall()
+    meta_by_entity_id: dict[str, int] = {}
+    if cursor.fetchone() is not None:
+        cursor.execute("SELECT metadata_id, entity_id FROM states_meta")
+        meta_by_entity_id = {
+            row["entity_id"]: row["metadata_id"] for row in cursor.fetchall()
+        }
+
+    resolved = {
+        key: meta_by_entity_id[eid]
+        for key, eid in entity_ids.items()
+        if key in keys and eid in meta_by_entity_id
     }
-    return {
-        key: meta_by_entity_id[entity_id]
-        for key, entity_id in entity_ids.items()
-        if entity_id in meta_by_entity_id
-    }
+    unrecorded = sorted(
+        eid
+        for key, eid in entity_ids.items()
+        if key in keys and eid not in meta_by_entity_id
+    )
+    if unrecorded and meta_by_entity_id:
+        _LOGGER.warning(
+            "Backfill: the recorder has no history for %s (renamed, or a "
+            "database from another install?); guessing those by name",
+            ", ".join(unrecorded),
+        )
+
+    wanted = [k for k in keys if k not in resolved]
+    if "device_tracker" in resolved:
+        wanted = [k for k in wanted if k not in ("latitude", "longitude")]
+    guessed: set[str] = set()
+    if wanted:
+        fuzzy = resolve_recorder_entities(
+            conn,
+            vin=vin,
+            vehicle_id=vehicle_id,
+            name_hint=_entity_name_hint(entity_ids.values()),
+        )
+        for key in wanted:
+            if key in fuzzy:
+                resolved[key] = fuzzy[key]
+                guessed.add(key)
+
+    names = {mid: eid for eid, mid in meta_by_entity_id.items()}
+    _LOGGER.info(
+        "Backfill entities for %s: %s",
+        vin or vehicle_id or "vehicle",
+        ", ".join(
+            f"{key}={names.get(mid, mid)}{' (guessed)' if key in guessed else ''}"
+            for key, mid in sorted(resolved.items())
+        )
+        or "none",
+    )
+    return resolved
 
 
 def _get_unit_of_measurement(
@@ -666,25 +747,9 @@ def reconstruct_tracks_for_windows(
 
     try:
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='states_meta'"
+        metadata_ids = _resolve_backfill_entities(
+            conn, entity_ids, tuple(_TRACK_ENTITY_UNIQUE_ID_KEYS), vin, vehicle_id
         )
-        has_states_meta = cursor.fetchone() is not None
-        meta_by_entity_id: dict[str, int] = {}
-        if has_states_meta:
-            cursor.execute("SELECT metadata_id, entity_id FROM states_meta")
-            for row in cursor.fetchall():
-                meta_by_entity_id[row["entity_id"]] = row["metadata_id"]
-
-        metadata_ids: dict[str, int] = {}
-        for key, entity_id in (entity_ids or {}).items():
-            if entity_id and entity_id in meta_by_entity_id:
-                metadata_ids[key] = meta_by_entity_id[entity_id]
-
-        if "device_tracker" not in metadata_ids:
-            fallback = resolve_recorder_entities(conn, vin=vin, vehicle_id=vehicle_id)
-            for key, mid in fallback.items():
-                metadata_ids.setdefault(key, mid)
 
         if "device_tracker" not in metadata_ids:
             _LOGGER.warning(
@@ -768,6 +833,20 @@ def reconstruct_tracks_for_windows(
 
             if len(track) >= MIN_TRACK_POINTS:
                 results[drive_id] = track
+
+        no_speed = sum(
+            1
+            for track in results.values()
+            if all(p.speed_mps is None for p in track.points)
+        )
+        _LOGGER.info(
+            "Rebuilt %d of %d routes from the recorder (%d without speed, "
+            "%d speed readings available)",
+            len(results),
+            len(windows),
+            no_speed,
+            len(speed_series),
+        )
 
         return results
     except (sqlite3.Error, OSError) as err:
@@ -859,14 +938,13 @@ def reconstruct_drives_from_sqlite(
     vehicle_id: str | None = None,
     days: int | None = None,
     battery_capacity: float | None = None,
-    context_entity_ids: dict[str, str] | None = None,
+    entity_ids: dict[str, str] | None = None,
 ) -> tuple[list[DriveRecord], dict[str, Any]]:
     """Synchronously reconstruct historical drive records from SQLite database.
 
-    ``context_entity_ids`` (from ``async_resolve_context_entity_ids``, the
-    entity-registry lookup) resolves the live vehicle-context fields (range,
-    drive mode, trailer, driver) precisely; any key it doesn't cover falls
-    back to the fuzzy matcher already used for everything else here.
+    ``entity_ids`` (from ``async_resolve_drive_entity_ids``, the entity
+    registry) names the car's own entities; a key it doesn't cover falls back
+    to the fuzzy matcher (see ``_resolve_backfill_entities``).
     """
     try:
         conn = open_sqlite_readonly(db_path)
@@ -875,11 +953,9 @@ def reconstruct_drives_from_sqlite(
         return [], {}
 
     try:
-        entities = resolve_recorder_entities(conn, vin=vin, vehicle_id=vehicle_id)
-        if context_entity_ids:
-            entities.update(
-                _resolve_metadata_ids_from_entity_ids(conn, context_entity_ids)
-            )
+        entities = _resolve_backfill_entities(
+            conn, entity_ids, _DRIVE_ENTITY_KEYS, vin, vehicle_id
+        )
         if "gear_selector" not in entities:
             _LOGGER.warning(
                 "No gear selector entity found in recorder database for backfill"
@@ -1522,13 +1598,12 @@ async def async_backfill_from_recorder(
             "No database path provided and could not resolve default recorder path"
         )
 
-    # Resolve vehicle-context entities (range/drive mode/trailer/driver) up
-    # front, on the event loop, the same way track entities are resolved
-    # further down -- reconstruct_drives_from_sqlite itself runs in the
-    # executor and has no registry access.
-    context_entity_ids: dict[str, str] = {}
+    # Resolve the car's entities through the entity registry up front, on the
+    # event loop -- reconstruct_drives_from_sqlite runs in the executor and
+    # has no registry access.
+    drive_entity_ids: dict[str, str] = {}
     if hass is not None and vin:
-        context_entity_ids = await async_resolve_context_entity_ids(hass, vin)
+        drive_entity_ids = await async_resolve_drive_entity_ids(hass, vin)
 
     # Run heavy extraction logic in executor thread
     if hass is not None:
@@ -1540,7 +1615,7 @@ async def async_backfill_from_recorder(
             vehicle_id,
             days,
             battery_capacity,
-            context_entity_ids,
+            drive_entity_ids,
         )
     else:
         loop = asyncio.get_running_loop()
@@ -1552,7 +1627,7 @@ async def async_backfill_from_recorder(
             vehicle_id,
             days,
             battery_capacity,
-            context_entity_ids,
+            drive_entity_ids,
         )
 
     vampire_events: list[VampireDrainRecord] = _meta.get("vampire_events", [])

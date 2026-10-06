@@ -13,6 +13,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
+from custom_components.rivian import history_backfill
 from custom_components.rivian.const import DOMAIN
 from custom_components.rivian.drive_models import (
     MICRO_DRIVE_THRESHOLD_MILES,
@@ -1445,3 +1446,167 @@ class TestReconstructDcfcSessionsFromSqlite:
         assert sessions[0].source == "backfill"
         assert sessions[0].max_power_kw < 22.0
         assert len(sessions[0].samples) <= 20
+
+
+def _build_lookalike_recorder_db(db_path: str, t0: float) -> None:
+    """A recorder DB where other integrations' look-alikes sort before the car's.
+
+    Mirrors a real production install: a speed test's ``speedtest_download``,
+    an ISS tracker's latitude/longitude sensors and a phone tracker all have
+    lower metadata_ids than the car's own ``r1s_*`` entities, so a plain
+    first-match picks them. One drive: Park -> Drive at t0, Park at t0 + 600.
+    """
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        "CREATE TABLE states_meta (metadata_id INTEGER PRIMARY KEY, entity_id TEXT)"
+    )
+    cur.execute(
+        "CREATE TABLE state_attributes (attributes_id INTEGER PRIMARY KEY, "
+        "hash INTEGER, shared_attrs TEXT)"
+    )
+    cur.execute(
+        "CREATE TABLE states (state_id INTEGER PRIMARY KEY, metadata_id INTEGER, "
+        "state TEXT, attributes_id INTEGER, last_updated_ts REAL, "
+        "last_changed_ts REAL, attributes TEXT)"
+    )
+    cur.executemany(
+        "INSERT INTO states_meta VALUES (?, ?)",
+        [
+            (1, "sensor.speedtest_download"),
+            (2, "sensor.iss_latitude"),
+            (3, "sensor.iss_longitude"),
+            (4, "device_tracker.phone"),
+            (5, "sensor.r1s_gear_selector"),
+            (6, "sensor.r1s_speed"),
+            (7, "device_tracker.r1s_location"),
+            (8, "sensor.r1s_odometer"),
+            (9, "sensor.r1s_battery_level"),
+        ],
+    )
+    attrs_id = 0
+
+    def _state(mid: int, state: str, ts: float, attrs: dict | None = None) -> None:
+        nonlocal attrs_id
+        aid = None
+        if attrs is not None:
+            attrs_id += 1
+            aid = attrs_id
+            cur.execute(
+                "INSERT INTO state_attributes VALUES (?, 0, ?)",
+                (aid, json.dumps(attrs)),
+            )
+        cur.execute(
+            "INSERT INTO states (metadata_id, state, attributes_id, last_updated_ts) "
+            "VALUES (?, ?, ?, ?)",
+            (mid, state, aid, ts),
+        )
+
+    _state(5, "park", t0 - 100)
+    _state(5, "drive", t0)
+    _state(5, "park", t0 + 600)
+    for i in range(0, 121, 6):
+        ts = t0 + i * 5.0
+        _state(1, "900.0", ts, {"unit_of_measurement": "Mbit/s"})
+        _state(2, "0.0", ts)
+        _state(3, "0.0", ts)
+        _state(4, "home", ts, {"latitude": 10.0, "longitude": 10.0})
+        _state(6, "35.0", ts, {"unit_of_measurement": "mph"})
+        _state(8, str(1000.0 + i * 0.05), ts, {"unit_of_measurement": "mi"})
+        _state(9, str(80.0 - i * 0.02), ts, {"unit_of_measurement": "%"})
+    for i in range(121):
+        _state(
+            7,
+            "not_home",
+            t0 + i * 5.0,
+            {"latitude": 40.60 + i * 0.0001, "longitude": -111.60 + i * 0.0001},
+        )
+    conn.commit()
+    conn.close()
+
+
+class TestRegistryFirstResolution:
+    """Backfill uses the car's own entities, not another integration's look-alikes."""
+
+    T0 = 1790000000.0
+    CAR_IDS = {
+        "gear_selector": "sensor.r1s_gear_selector",
+        "speed": "sensor.r1s_speed",
+        "device_tracker": "device_tracker.r1s_location",
+        "odometer": "sensor.r1s_odometer",
+        "battery_level": "sensor.r1s_battery_level",
+    }
+
+    def test_entity_name_hint(self) -> None:
+        """The shared object_id prefix of the car's entities, cut at an underscore."""
+        hint = history_backfill._entity_name_hint
+        assert hint(["sensor.r1s_speed", "device_tracker.r1s_location"]) == "r1s_"
+        assert hint(["sensor.my_r1t_speed", "sensor.my_r1t_gear"]) == "my_r1t_"
+        assert hint(["sensor.r1s_speed"]) is None
+        assert hint(["sensor.speed", "sensor.gear"]) is None
+
+    def test_drives_use_registry_entities(self, tmp_path: Any) -> None:
+        """Speed and position come from the car, not the speed test or ISS sensors."""
+        db_path = str(tmp_path / "recorder.db")
+        _build_lookalike_recorder_db(db_path, self.T0)
+
+        drives, _ = reconstruct_drives_from_sqlite(
+            db_path, vin=TEST_VIN, entity_ids=self.CAR_IDS
+        )
+
+        assert len(drives) == 1
+        assert drives[0].max_speed_mph == 35.0
+        assert drives[0].start_lat == pytest.approx(40.60, abs=0.01)
+        assert drives[0].start_lon == pytest.approx(-111.60, abs=0.01)
+
+    def test_guessed_keys_stay_on_the_car(self, tmp_path: Any) -> None:
+        """A key the registry misses is guessed among the car's own entities."""
+        db_path = str(tmp_path / "recorder.db")
+        _build_lookalike_recorder_db(db_path, self.T0)
+        ids = {k: v for k, v in self.CAR_IDS.items() if k != "speed"}
+
+        drives, _ = reconstruct_drives_from_sqlite(
+            db_path, vin=TEST_VIN, entity_ids=ids
+        )
+
+        assert drives[0].max_speed_mph == 35.0
+
+    def test_track_speed_falls_back_when_registry_id_unrecorded(
+        self, tmp_path: Any
+    ) -> None:
+        """A renamed speed entity (no history under its id) still gets the car's speed."""
+        db_path = str(tmp_path / "recorder.db")
+        _build_lookalike_recorder_db(db_path, self.T0)
+        ids = {**self.CAR_IDS, "speed": "sensor.r1s_speed_2"}
+
+        tracks = reconstruct_tracks_for_windows(
+            db_path, ids, [("d1", self.T0, self.T0 + 600.0)]
+        )
+
+        speeds = [p.speed_mps for p in tracks["d1"].points]
+        assert speeds == pytest.approx([35.0 * 1609.344 / 3600.0] * len(speeds))
+
+    @pytest.mark.asyncio
+    async def test_drive_resolver_covers_gear_and_charging(
+        self, mock_hass: Any
+    ) -> None:
+        """Gear and charging status resolve through their own unique_ids."""
+        registry = MagicMock()
+        registry.async_get_entity_id.side_effect = lambda domain, _p, uid: {
+            ("sensor", f"{TEST_VIN}-gear_status"): "sensor.r1s_gear_selector",
+            ("binary_sensor", f"{TEST_VIN}-charger_state"): (
+                "binary_sensor.r1s_charging_status"
+            ),
+        }.get((domain, uid))
+        er_module = MagicMock()
+        er_module.async_get.return_value = registry
+
+        with patch("custom_components.rivian.history_backfill.er", er_module):
+            resolved = await history_backfill.async_resolve_drive_entity_ids(
+                mock_hass, TEST_VIN
+            )
+
+        assert resolved == {
+            "gear_selector": "sensor.r1s_gear_selector",
+            "charging_status": "binary_sensor.r1s_charging_status",
+        }
