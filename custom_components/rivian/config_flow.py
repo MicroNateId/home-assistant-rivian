@@ -79,6 +79,11 @@ DEFAULT_TRACK_FULL_DETAIL_DAYS = 0  # 0 = never thin
 TRACK_FULL_DETAIL_DAYS_MIN = 0
 TRACK_FULL_DETAIL_DAYS_MAX = 3650
 
+# Whether unnamed, frequently-visited "auto" places are reverse-geocoded via
+# the public OSM Nominatim API. Kept here for the same reason as the options
+# above -- __init__.py imports this name from this module.
+CONF_PLACE_GEOCODING = "place_geocoding"
+DEFAULT_PLACE_GEOCODING = True
 
 STEP_OTP_DATA_SCHEMA = vol.Schema({vol.Required(CONF_OTP): str})
 R1S = DeviceFilterSelectorConfig(integration=DOMAIN, manufacturer="Rivian", model="R1S")
@@ -131,6 +136,9 @@ OPTIONS_SCHEMA = vol.Schema(
                 mode=NumberSelectorMode.BOX,
             )
         ),
+        vol.Optional(
+            CONF_PLACE_GEOCODING, default=DEFAULT_PLACE_GEOCODING
+        ): BooleanSelector(),
     }
 )
 
