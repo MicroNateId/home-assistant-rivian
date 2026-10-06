@@ -28,6 +28,10 @@ DOMAIN = "rivian"
 VERSION = "0.0.0"
 ISSUE_URL = "https://github.com/bretterer/home-assistant-rivian/issues"
 
+# Bumped whenever the generated efficiency dashboard's config shape changes,
+# so a stale, previously-generated dashboard can be detected and regenerated.
+DASHBOARD_SCHEMA_VERSION: Final[int] = 13
+
 # Fired with {"vin": ...} when a VIN's stored analytics change (drive completed,
 # backfill finished); the WebSocket subscribe command relays it to the frontend.
 RIVIAN_ANALYTICS_UPDATED_EVENT: Final[str] = "rivian_analytics_updated"
