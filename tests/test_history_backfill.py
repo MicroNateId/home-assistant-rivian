@@ -1690,3 +1690,95 @@ class TestBackfillStatistics:
         drives = await store.async_drives_since(0.0)
         earliest = min(history_backfill._iso_to_ts(d.start_time) for d in drives)
         rewrite.assert_awaited_once_with(mock_hass, store, earliest)
+
+
+class TestTrackSpeedFallback:
+    """Routes get a speed even when the speed sensor's history is missing."""
+
+    T0 = 1790000000.0
+
+    def _db_with_one_speed_reading(self, tmp_path: Any) -> str:
+        db_path = str(tmp_path / "recorder.db")
+        _build_lookalike_recorder_db(db_path, self.T0)
+        conn = sqlite3.connect(db_path)
+        # Keep only the first speed reading (sensor.r1s_speed is metadata_id 6).
+        conn.execute(
+            "DELETE FROM states WHERE metadata_id = 6 AND last_updated_ts > ?",
+            (self.T0,),
+        )
+        conn.commit()
+        conn.close()
+        return db_path
+
+    def test_gps_speed_fills_fixes_with_no_nearby_reading(
+        self, tmp_path: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        db_path = self._db_with_one_speed_reading(tmp_path)
+
+        with caplog.at_level("INFO"):
+            tracks = reconstruct_tracks_for_windows(
+                db_path,
+                TestRegistryFirstResolution.CAR_IDS,
+                [("d1", self.T0, self.T0 + 600.0)],
+            )
+
+        speeds = [p.speed_mps for p in tracks["d1"].points]
+        # The one reading (35 mph = 15.6 m/s) only covers fixes within 60 s.
+        assert speeds[0] == pytest.approx(15.6464, abs=0.01)
+        # Later fixes move ~14 m every 5 s: ~2.8 m/s, from the GPS positions.
+        assert speeds[-1] == pytest.approx(2.79, abs=0.1)
+        assert all(s is not None for s in speeds)
+        assert "1 with speed estimated from GPS positions" in caplog.text
+        assert "little or no recorder history" in caplog.text
+
+    def test_drive_without_locations_is_counted(
+        self, tmp_path: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        db_path = str(tmp_path / "recorder.db")
+        _build_lookalike_recorder_db(db_path, self.T0)
+
+        with caplog.at_level("INFO"):
+            tracks = reconstruct_tracks_for_windows(
+                db_path,
+                TestRegistryFirstResolution.CAR_IDS,
+                [
+                    ("d1", self.T0, self.T0 + 600.0),
+                    ("d2", self.T0 + 9000, self.T0 + 9600),
+                ],
+            )
+
+        assert set(tracks) == {"d1"}
+        assert "1 drives have fewer than 2 recorded locations" in caplog.text
+
+    def test_value_near_ignores_stale_readings(self) -> None:
+        series = [(100.0, 1.0), (200.0, 2.0)]
+        assert history_backfill._value_near(series, 150.0, 60.0) == 1.0
+        assert history_backfill._value_near(series, 190.0, 60.0) == 2.0
+        assert history_backfill._value_near(series, 300.0, 60.0) is None
+        assert history_backfill._value_near([], 100.0, 60.0) is None
+
+    def test_gps_speeds_skip_dropouts_and_glitches(self) -> None:
+        # 100 m in 10 s, then a 10 min dropout, then a 50 km jump in 10 s.
+        pts = [
+            (0.0, 40.0, -111.0),
+            (10.0, 40.0009, -111.0),
+            (610.0, 40.0018, -111.0),
+            (620.0, 40.45, -111.0),
+        ]
+        speeds = history_backfill._gps_speeds(pts)
+        assert speeds[0] == pytest.approx(10.0, abs=0.1)
+        assert speeds[1] == pytest.approx(10.0, abs=0.1)
+        assert speeds[2] is None and speeds[3] is None
+
+    def test_drive_with_one_speed_reading_uses_its_average(self, tmp_path: Any) -> None:
+        """One stray reading doesn't put the whole drive in its speed bin."""
+        db_path = self._db_with_one_speed_reading(tmp_path)
+
+        drives, _ = reconstruct_drives_from_sqlite(
+            db_path, vin=TEST_VIN, entity_ids=TestRegistryFirstResolution.CAR_IDS
+        )
+
+        drive = drives[0]
+        # 6 mi in 10 min is 36 mph on average; the lone 35 mph reading is ignored.
+        assert drive.max_speed_mph == pytest.approx(36.0, abs=0.1)
+        assert drive.speed_bins["30-39"].miles == pytest.approx(6.0, abs=0.01)

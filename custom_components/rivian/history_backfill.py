@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import bisect
 from collections.abc import Callable
 from datetime import datetime, timezone
 import json
@@ -33,7 +34,7 @@ from .drive_models import (
     trailer_attached_any,
 )
 from .drive_storage import DriveStore
-from .drive_track import DriveTrack, TrackPoint
+from .drive_track import DriveTrack, TrackPoint, haversine_m
 from .statistics import async_rewrite_statistics
 from .weather import OpenMeteoWeatherClient
 
@@ -50,6 +51,17 @@ FEET_TO_METERS: Final[float] = 1.0 / METERS_TO_FEET
 KM_TO_MILES: Final[float] = 0.621371
 TRACK_WINDOW_PAD_SECONDS: Final[float] = 30.0
 MIN_TRACK_POINTS: Final[int] = 2
+# A recorded speed applies to a GPS fix only if it was reported this close in
+# time; otherwise one stray reading would colour a whole drive.
+TRACK_SPEED_MAX_AGE_S: Final[float] = 60.0
+# Speed estimated from neighbouring fixes: ignore pairs further apart than
+# this (a dropout, not driving) and implausible results (GPS glitches).
+GPS_SPEED_MAX_GAP_S: Final[float] = 120.0
+GPS_SPEED_MAX_MPS: Final[float] = 60.0
+# A drive's recorded speeds feed its speed bins and max speed only when there
+# is about one reading per this many seconds; sparser history (a sensor the
+# recorder mostly missed) falls back to the drive's average speed.
+DRIVE_SPEED_MIN_COVERAGE_S: Final[float] = 120.0
 
 # Recorder entity_id -> (entity registry domain, unique_id suffix) for the
 # fields a GPS track needs, matching the unique_id scheme in entity.py
@@ -470,6 +482,48 @@ def _extract_coordinates_series(
     return lat_series, lon_series
 
 
+def _value_near(
+    series: list[tuple[float, float]], target_ts: float, max_age_s: float
+) -> float | None:
+    """Return the series value nearest ``target_ts``, if one is within ``max_age_s``."""
+    if not series:
+        return None
+    i = bisect.bisect_left(series, (target_ts, float("-inf")))
+    best: tuple[float, float] | None = None
+    for j in (i - 1, i):
+        if 0 <= j < len(series):
+            gap = abs(series[j][0] - target_ts)
+            if gap <= max_age_s and (best is None or gap < best[0]):
+                best = (gap, series[j][1])
+    return best[1] if best is not None else None
+
+
+def _gps_speeds(points: list[tuple[float, float, float]]) -> list[float | None]:
+    """Estimate each fix's speed (m/s) from its neighbouring fixes.
+
+    ``points`` are ``(t, lat, lon)`` in time order. Each speed is the distance
+    over the time to the previous and next fix (one side at the ends);
+    neighbours over ``GPS_SPEED_MAX_GAP_S`` away don't count, and a result
+    over ``GPS_SPEED_MAX_MPS`` (a position glitch) is None.
+    """
+    speeds: list[float | None] = []
+    for i, (t, lat, lon) in enumerate(points):
+        dist = 0.0
+        span = 0.0
+        for j in (i - 1, i + 1):
+            if 0 <= j < len(points):
+                tj, latj, lonj = points[j]
+                dt = abs(tj - t)
+                if 0.0 < dt <= GPS_SPEED_MAX_GAP_S:
+                    dist += haversine_m(lat, lon, latj, lonj)
+                    span += dt
+        speed = dist / span if span > 0 else None
+        speeds.append(
+            speed if speed is not None and speed <= GPS_SPEED_MAX_MPS else None
+        )
+    return speeds
+
+
 def _get_value_at_ts(
     series: list[tuple[float, float]],
     target_ts: float,
@@ -837,6 +891,8 @@ def reconstruct_tracks_for_windows(
         odo_series, odo_unit = _load_numeric("odometer")
 
         results: dict[str, DriveTrack] = {}
+        too_few_fixes = 0
+        gps_speed_tracks = 0
         for drive_id, start_ts, end_ts in windows:
             w_start = start_ts - TRACK_WINDOW_PAD_SECONDS
             w_end = end_ts + TRACK_WINDOW_PAD_SECONDS
@@ -844,6 +900,7 @@ def reconstruct_tracks_for_windows(
             win_lat = [(t, v) for t, v in lat_series if w_start <= t <= w_end]
             win_lon = [(t, v) for t, v in lon_series if w_start <= t <= w_end]
             if len(win_lat) < MIN_TRACK_POINTS or len(win_lon) < MIN_TRACK_POINTS:
+                too_few_fixes += 1
                 continue
 
             win_speed = [(t, v) for t, v in speed_series if w_start <= t <= w_end]
@@ -851,11 +908,19 @@ def reconstruct_tracks_for_windows(
             win_soc = [(t, v) for t, v in soc_series if w_start <= t <= w_end]
             win_odo = [(t, v) for t, v in odo_series if w_start <= t <= w_end]
 
+            fixes = [(t, lat, lon) for (t, lat), (_t, lon) in zip(win_lat, win_lon)]
+            gps_speeds = _gps_speeds(fixes)
+            used_gps_speed = False
             track = DriveTrack()
-            for (t, lat), (_lon_t, lon) in zip(win_lat, win_lon):
-                spd = _get_value_at_ts(win_speed, t) if win_speed else None
+            for (t, lat, lon), gps_speed in zip(fixes, gps_speeds):
+                spd = _value_near(win_speed, t, TRACK_SPEED_MAX_AGE_S)
                 if spd is not None:
                     spd = _convert_speed_to_mps(spd, speed_unit)
+                elif gps_speed is not None:
+                    # No speed reported near this fix (the speed sensor's
+                    # history is missing or sparse): estimate it from the route.
+                    spd = gps_speed
+                    used_gps_speed = True
                 alt = _get_value_at_ts(win_alt, t) if win_alt else None
                 if alt is not None:
                     alt = _convert_length_to_meters(alt, alt_unit)
@@ -877,6 +942,9 @@ def reconstruct_tracks_for_windows(
 
             if len(track) >= MIN_TRACK_POINTS:
                 results[drive_id] = track
+                gps_speed_tracks += used_gps_speed
+            else:
+                too_few_fixes += 1
 
         no_speed = sum(
             1
@@ -884,13 +952,24 @@ def reconstruct_tracks_for_windows(
             if all(p.speed_mps is None for p in track.points)
         )
         _LOGGER.info(
-            "Rebuilt %d of %d routes from the recorder (%d without speed, "
-            "%d speed readings available)",
+            "Rebuilt %d of %d routes from the recorder (%d with speed estimated "
+            "from GPS positions, %d without speed, %d speed readings available); "
+            "%d drives have fewer than %d recorded locations and get no route",
             len(results),
             len(windows),
+            gps_speed_tracks,
             no_speed,
             len(speed_series),
+            too_few_fixes,
+            MIN_TRACK_POINTS,
         )
+        if gps_speed_tracks and gps_speed_tracks * 2 >= len(results):
+            _LOGGER.warning(
+                "The speed sensor (%s) has little or no recorder history for "
+                "these drives, so route speeds were estimated from GPS "
+                "positions. Check that the recorder doesn't exclude it",
+                entity_ids.get("speed") or "not found",
+            )
 
         return results
     except (sqlite3.Error, OSError) as err:
@@ -1175,6 +1254,8 @@ def reconstruct_drives_from_sqlite(
 
             # Speed samples and bins
             seg_speeds = [(t, s) for t, s in speed_series if start_ts <= t <= end_ts]
+            if len(seg_speeds) < max(2.0, duration_s / DRIVE_SPEED_MIN_COVERAGE_S):
+                seg_speeds = []
             speed_bins = {b: SpeedBinData() for b in STANDARD_SPEED_BINS}
             max_speed = 0.0
             avg_speed = 0.0
@@ -1237,7 +1318,7 @@ def reconstruct_drives_from_sqlite(
                 chunk_kwh = round((chunk_dsoc * pack_capacity) / 100.0, 2)
 
                 win_speeds = [s for t, s in speed_series if t_curr <= t <= t_next]
-                if win_speeds:
+                if len(win_speeds) >= max(2.0, dt_win / DRIVE_SPEED_MIN_COVERAGE_S):
                     chunk_avg_spd = round(sum(win_speeds) / len(win_speeds), 1)
                 elif chunk_dist > 0 and dt_win > 0:
                     chunk_avg_spd = round(chunk_dist / (dt_win / 3600.0), 1)
