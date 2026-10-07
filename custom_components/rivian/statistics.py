@@ -121,7 +121,7 @@ def _parse_start_time(value: str) -> datetime | None:
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=dt_util.UTC)
-    return parsed
+    return parsed.astimezone(dt_util.UTC)
 
 
 def _bucket_drives(drives: list[DriveRecord]) -> list[_HourBucket]:

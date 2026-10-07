@@ -1077,6 +1077,48 @@ class TestDriveTrackerCharging:
         )
 
     @pytest.mark.asyncio
+    async def test_chunk_reaching_sea_level_counts_the_descent(
+        self, mock_hass: Any, analytics_db: Any
+    ) -> None:
+        """A 0 m altitude reading is a real value, not "no reading"."""
+        coordinator = MockVehicleCoordinator()
+        store = DriveStore(mock_hass, TEST_VIN, analytics_db)
+        tracker = DriveTracker(
+            hass=mock_hass,
+            entry=MagicMock(),
+            coordinator=coordinator,  # type: ignore[arg-type]
+            vehicle_info={
+                "vin": TEST_VIN,
+                "id": TEST_VEHICLE_ID,
+                "battery_capacity": 135.0,
+            },
+            store=store,
+        )
+        coordinator.set_telemetry(gear="park", altitude_m=50.0)
+        await tracker.async_setup()
+
+        base = datetime.now(timezone.utc)
+        clock = {"now": base}
+        tracker._utcnow = lambda: clock["now"]  # type: ignore[method-assign]
+        odo = 1609344.0
+        coordinator.set_telemetry(
+            gear="drive", odometer_m=odo, altitude_m=50.0, battery_soc=80.0
+        )
+        for i in range(1, 9):
+            clock["now"] = base + timedelta(seconds=i * 30)
+            coordinator.set_telemetry(
+                gear="drive",
+                speed_mps=20.0,
+                odometer_m=odo + i * 600.0,
+                altitude_m=max(0.0, 50.0 - i * 10.0),
+                battery_soc=80.0 - i * 0.2,
+            )
+
+        chunks = tracker._active_drive["chunks"]
+        assert chunks
+        assert chunks[0].elevation_change_ft == pytest.approx(-50.0 * 3.28084, abs=1)
+
+    @pytest.mark.asyncio
     async def test_dcfc_estimated_from_soc_when_no_power_reported(
         self, mock_hass: Any, analytics_db: Any
     ) -> None:

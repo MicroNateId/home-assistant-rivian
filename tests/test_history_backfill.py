@@ -876,7 +876,6 @@ class TestServiceRegistration:
                 "backfill_drive_history",
                 service_data={
                     "vin": TEST_VIN,
-                    "db_path": FIXTURE_DB_PATH,
                 },
             )
             mock_backfill.assert_called_once_with(
@@ -884,7 +883,6 @@ class TestServiceRegistration:
                 vin=TEST_VIN,
                 days=None,
                 dry_run=True,
-                db_path=FIXTURE_DB_PATH,
                 store=ANY,
                 tracks=True,
             )
@@ -900,7 +898,6 @@ class TestServiceRegistration:
                 service_data={
                     "vin": TEST_VIN,
                     "dry_run": False,
-                    "db_path": FIXTURE_DB_PATH,
                 },
             )
             mock_backfill_live.assert_called_once_with(
@@ -908,7 +905,6 @@ class TestServiceRegistration:
                 vin=TEST_VIN,
                 days=None,
                 dry_run=False,
-                db_path=FIXTURE_DB_PATH,
                 store=ANY,
                 tracks=True,
             )
@@ -1448,13 +1444,17 @@ class TestReconstructDcfcSessionsFromSqlite:
         assert len(sessions[0].samples) <= 20
 
 
-def _build_lookalike_recorder_db(db_path: str, t0: float) -> None:
+def _build_lookalike_recorder_db(
+    db_path: str, t0: float, *, metric: bool = False
+) -> None:
     """A recorder DB where other integrations' look-alikes sort before the car's.
 
     Mirrors a real production install: a speed test's ``speedtest_download``,
     an ISS tracker's latitude/longitude sensors and a phone tracker all have
     lower metadata_ids than the car's own ``r1s_*`` entities, so a plain
-    first-match picks them. One drive: Park -> Drive at t0, Park at t0 + 600.
+    first-match picks them. One drive: Park -> Drive at t0, Park at t0 + 600,
+    at 35 mph over 6 mi, climbing 100 ft. ``metric`` records the same drive
+    the way a metric Home Assistant does (km/h, km, m).
     """
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
@@ -1482,6 +1482,7 @@ def _build_lookalike_recorder_db(db_path: str, t0: float) -> None:
             (7, "device_tracker.r1s_location"),
             (8, "sensor.r1s_odometer"),
             (9, "sensor.r1s_battery_level"),
+            (10, "sensor.r1s_altitude"),
         ],
     )
     attrs_id = 0
@@ -1511,8 +1512,16 @@ def _build_lookalike_recorder_db(db_path: str, t0: float) -> None:
         _state(2, "0.0", ts)
         _state(3, "0.0", ts)
         _state(4, "home", ts, {"latitude": 10.0, "longitude": 10.0})
-        _state(6, "35.0", ts, {"unit_of_measurement": "mph"})
-        _state(8, str(1000.0 + i * 0.05), ts, {"unit_of_measurement": "mi"})
+        odo_mi = 1000.0 + i * 0.05
+        alt_ft = 4000.0 + i * (100.0 / 120.0)
+        if metric:
+            _state(6, str(35.0 * 1.609344), ts, {"unit_of_measurement": "km/h"})
+            _state(8, str(odo_mi * 1.609344), ts, {"unit_of_measurement": "km"})
+            _state(10, str(alt_ft * 0.3048), ts, {"unit_of_measurement": "m"})
+        else:
+            _state(6, "35.0", ts, {"unit_of_measurement": "mph"})
+            _state(8, str(odo_mi), ts, {"unit_of_measurement": "mi"})
+            _state(10, str(alt_ft), ts, {"unit_of_measurement": "ft"})
         _state(9, str(80.0 - i * 0.02), ts, {"unit_of_measurement": "%"})
     for i in range(121):
         _state(
@@ -1610,3 +1619,74 @@ class TestRegistryFirstResolution:
             "gear_selector": "sensor.r1s_gear_selector",
             "charging_status": "binary_sensor.r1s_charging_status",
         }
+
+
+class TestRecordedUnits:
+    """The drive builder converts what the recorder stored into miles, mph and feet."""
+
+    T0 = 1790000000.0
+    CAR_IDS = {
+        **TestRegistryFirstResolution.CAR_IDS,
+        "altitude": "sensor.r1s_altitude",
+    }
+
+    @pytest.mark.parametrize("metric", [False, True])
+    def test_metric_and_imperial_recorders_agree(
+        self, tmp_path: Any, metric: bool
+    ) -> None:
+        db_path = str(tmp_path / "recorder.db")
+        _build_lookalike_recorder_db(db_path, self.T0, metric=metric)
+
+        drives, _ = reconstruct_drives_from_sqlite(
+            db_path, vin=TEST_VIN, entity_ids=self.CAR_IDS
+        )
+
+        assert len(drives) == 1
+        drive = drives[0]
+        assert drive.distance_miles == pytest.approx(6.0, abs=0.01)
+        assert drive.max_speed_mph == pytest.approx(35.0, abs=0.1)
+        assert drive.start_altitude_ft == pytest.approx(4000.0, abs=0.1)
+        assert drive.elevation_change_ft == pytest.approx(100.0, abs=0.1)
+        assert drive.start_odometer_mi == pytest.approx(1000.0, abs=0.01)
+
+    def test_unrecorded_unit_keeps_the_legacy_assumption(self) -> None:
+        """With no unit recorded, values are read as before (mph, ft, mi)."""
+        assert history_backfill._speed_to_mph(35.0, None) == 35.0
+        assert history_backfill._length_to_feet(4000.0, None) == 4000.0
+        assert history_backfill._length_to_miles(1000.0, None) == 1000.0
+        assert history_backfill._range_to_miles(100.0, None) == pytest.approx(62.1371)
+        assert history_backfill._range_to_miles(100.0, "mi") == pytest.approx(100.0)
+
+    def test_odometer_heuristic_only_without_a_unit(self) -> None:
+        """A high-mileage odometer in miles isn't mistaken for metres."""
+        delta = history_backfill._odo_delta_miles
+        assert delta(60000.0, 60120.0, unit_known=True) == 120.0
+        assert delta(60000.0, 61609.344, unit_known=False) == pytest.approx(1.0)
+
+
+class TestBackfillStatistics:
+    """A backfill recomputes long-term statistics instead of appending to them."""
+
+    @pytest.mark.asyncio
+    async def test_rewrites_from_the_earliest_new_drive(
+        self, mock_hass: Any, analytics_db: Any
+    ) -> None:
+        store = DriveStore(hass=mock_hass, vin=TEST_VIN, db=analytics_db)
+        await store.async_load()
+        weather = MagicMock()
+        weather.async_get_historical_temperatures = AsyncMock(return_value={})
+        rewrite = AsyncMock()
+
+        with patch.object(history_backfill, "async_rewrite_statistics", rewrite):
+            await async_backfill_from_recorder(
+                hass=mock_hass,
+                vin=TEST_VIN,
+                db_path=FIXTURE_DB_PATH,
+                dry_run=False,
+                store=store,
+                weather_client=weather,
+            )
+
+        drives = await store.async_drives_since(0.0)
+        earliest = min(history_backfill._iso_to_ts(d.start_time) for d in drives)
+        rewrite.assert_awaited_once_with(mock_hass, store, earliest)

@@ -164,7 +164,6 @@ BACKFILL_SERVICE_SCHEMA = vol.Schema(
         vol.Optional("vin"): cv.string,
         vol.Optional("days"): vol.Coerce(int),
         vol.Optional("dry_run", default=True): cv.boolean,
-        vol.Optional("db_path"): cv.string,
         vol.Optional("tracks", default=True): cv.boolean,
     }
 )
@@ -967,7 +966,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         vin = call.data.get("vin")
         days = call.data.get("days")
         dry_run = call.data.get("dry_run", True)
-        db_path = call.data.get("db_path")
         tracks = call.data.get("tracks", True)
 
         target_vins: list[str] = []
@@ -1007,7 +1005,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 vin=target_vin,
                 days=days,
                 dry_run=dry_run,
-                db_path=db_path,
                 store=matched_store,
                 tracks=tracks,
             )

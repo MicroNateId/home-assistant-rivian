@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from datetime import datetime, timezone
 import json
 import logging
@@ -33,7 +34,7 @@ from .drive_models import (
 )
 from .drive_storage import DriveStore
 from .drive_track import DriveTrack, TrackPoint
-from .statistics import async_update_statistics
+from .statistics import async_rewrite_statistics
 from .weather import OpenMeteoWeatherClient
 
 if TYPE_CHECKING:
@@ -337,6 +338,24 @@ def resolve_recorder_entities(
     return resolved
 
 
+def _states_ts_col(conn: sqlite3.Connection) -> str:
+    """Return the states table's timestamp column (float on newer recorders)."""
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(states)")
+    columns = {row["name"] for row in cursor.fetchall()}
+    return "last_updated_ts" if "last_updated_ts" in columns else "last_updated"
+
+
+def _row_ts(raw_ts: Any) -> float | None:
+    """Return a states row's timestamp as POSIX seconds, or None if unparsable."""
+    if isinstance(raw_ts, (int, float)):
+        return float(raw_ts)
+    try:
+        return datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
 def _extract_timeseries(
     conn: sqlite3.Connection,
     metadata_id: int,
@@ -344,11 +363,7 @@ def _extract_timeseries(
 ) -> list[tuple[float, str]]:
     """Extract ordered (timestamp, state) series for a metadata_id."""
     cursor = conn.cursor()
-
-    # Determine timestamp column name
-    cursor.execute("PRAGMA table_info(states)")
-    columns = [row["name"] for row in cursor.fetchall()]
-    ts_col = "last_updated_ts" if "last_updated_ts" in columns else "last_updated"
+    ts_col = _states_ts_col(conn)
 
     query = f"SELECT state, {ts_col} FROM states WHERE metadata_id = ? "
     params: list[Any] = [metadata_id]
@@ -371,16 +386,9 @@ def _extract_timeseries(
             "signal_not_available",
         ):
             continue
-        try:
-            if isinstance(raw_ts, (int, float)):
-                ts_val = float(raw_ts)
-            else:
-                # Parse string timestamp
-                dt = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
-                ts_val = dt.timestamp()
+        ts_val = _row_ts(raw_ts)
+        if ts_val is not None:
             records.append((ts_val, str(state_str)))
-        except (ValueError, TypeError):
-            continue
 
     return records
 
@@ -421,12 +429,10 @@ def _extract_coordinates_series(
             attrs_str = row["shared_attrs"]
             if not attrs_str:
                 continue
+            ts_val = _row_ts(raw_ts)
+            if ts_val is None:
+                continue
             try:
-                if isinstance(raw_ts, (int, float)):
-                    ts_val = float(raw_ts)
-                else:
-                    dt = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
-                    ts_val = dt.timestamp()
                 attrs = json.loads(attrs_str)
                 lat = attrs.get("latitude")
                 lon = attrs.get("longitude")
@@ -448,12 +454,10 @@ def _extract_coordinates_series(
             attrs_str = row["attributes"]
             if not attrs_str:
                 continue
+            ts_val = _row_ts(raw_ts)
+            if ts_val is None:
+                continue
             try:
-                if isinstance(raw_ts, (int, float)):
-                    ts_val = float(raw_ts)
-                else:
-                    dt = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
-                    ts_val = dt.timestamp()
                 attrs = json.loads(attrs_str)
                 lat = attrs.get("latitude")
                 lon = attrs.get("longitude")
@@ -711,6 +715,49 @@ def _convert_length_to_meters(value: float, unit: str | None) -> float:
     return value  # already metres (or unknown - assume SI)
 
 
+# The drive builder works in miles, mph and feet. Each converter below takes
+# the recorded unit_of_measurement; with no unit recorded the value is kept
+# as is (the builder's historical assumption), with one it is converted, so
+# a metric Home Assistant's km/h, m and km are no longer read as imperial.
+def _speed_to_mph(value: float, unit: str | None) -> float:
+    if not unit:
+        return value
+    return _convert_speed_to_mps(value, unit) * 3600.0 / METERS_PER_MILE
+
+
+def _length_to_feet(value: float, unit: str | None) -> float:
+    if not unit:
+        return value
+    return _convert_length_to_meters(value, unit) * METERS_TO_FEET
+
+
+def _length_to_miles(value: float, unit: str | None) -> float:
+    if not unit:
+        return value
+    return _convert_length_to_meters(value, unit) / METERS_PER_MILE
+
+
+def _range_to_miles(value: float, unit: str | None) -> float:
+    # Rivian reports distanceToEmpty in km; the sensor records it in the
+    # user's display unit, and that recorded unit wins when present.
+    if not unit:
+        return value * KM_TO_MILES
+    return _convert_length_to_meters(value, unit) / METERS_PER_MILE
+
+
+def _odo_delta_miles(start: float, end: float, unit_known: bool) -> float:
+    """Return the distance between two odometer readings in miles.
+
+    With no recorded unit, a large reading that moved by more than 50 is
+    taken to be metres (the raw API value); with one, the readings were
+    already converted to miles at load time.
+    """
+    delta = end - start
+    if not unit_known and start > 50000.0 and delta > 50.0:
+        return round(delta / METERS_PER_MILE, 2)
+    return round(max(0.0, delta), 2)
+
+
 def reconstruct_tracks_for_windows(
     db_path: str,
     entity_ids: dict[str, str],
@@ -746,7 +793,6 @@ def reconstruct_tracks_for_windows(
         return {}
 
     try:
-        cursor = conn.cursor()
         metadata_ids = _resolve_backfill_entities(
             conn, entity_ids, tuple(_TRACK_ENTITY_UNIQUE_ID_KEYS), vin, vehicle_id
         )
@@ -757,9 +803,7 @@ def reconstruct_tracks_for_windows(
             )
             return {}
 
-        cursor.execute("PRAGMA table_info(states)")
-        columns = [row["name"] for row in cursor.fetchall()]
-        ts_col = "last_updated_ts" if "last_updated_ts" in columns else "last_updated"
+        ts_col = _states_ts_col(conn)
 
         global_start = min(w[1] for w in windows) - TRACK_WINDOW_PAD_SECONDS
         global_end = max(w[2] for w in windows) + TRACK_WINDOW_PAD_SECONDS
@@ -975,23 +1019,34 @@ def reconstruct_drives_from_sqlite(
             _LOGGER.info("No gear transitions recorded in the specified timeframe")
             return [], {}
 
-        # 2. Extract telemetry series
-        def load_numeric_series(key: str) -> list[tuple[float, float]]:
+        # 2. Extract telemetry series, converted to the builder's units
+        ts_col = _states_ts_col(conn)
+        units: dict[str, str | None] = {}
+
+        def load_numeric_series(
+            key: str, convert: Callable[[float, str | None], float] | None = None
+        ) -> list[tuple[float, float]]:
             if key not in entities:
                 return []
+            unit = None
+            if convert is not None:
+                unit = _get_unit_of_measurement(conn, entities[key], ts_col)
+                units[key] = unit
             raw = _extract_timeseries(conn, entities[key], start_ts=cutoff_ts)
             res = []
             for ts, val in raw:
                 try:
-                    res.append((ts, float(val)))
+                    num = float(val)
                 except (ValueError, TypeError):
                     continue
+                res.append((ts, convert(num, unit) if convert else num))
             return res
 
-        odometer_series = load_numeric_series("odometer")
+        odometer_series = load_numeric_series("odometer", _length_to_miles)
+        odo_unit_known = bool(units.get("odometer"))
         soc_series = load_numeric_series("battery_level")
-        speed_series = load_numeric_series("speed")
-        alt_series = load_numeric_series("altitude")
+        speed_series = load_numeric_series("speed", _speed_to_mph)
+        alt_series = load_numeric_series("altitude", _length_to_feet)
         lat_series = load_numeric_series("latitude")
         lon_series = load_numeric_series("longitude")
 
@@ -1004,9 +1059,9 @@ def reconstruct_drives_from_sqlite(
                 lon_series = trk_lon
 
         # Vehicle-context series (range/drive mode/trailer/driver). Range is
-        # numeric (km); the rest are raw string states, read like the gear
+        # numeric (converted to miles); the rest are raw string states, read like the gear
         # selector series above.
-        range_series = load_numeric_series("distance_to_empty")
+        range_series = load_numeric_series("distance_to_empty", _range_to_miles)
         drive_mode_raw_series = (
             _extract_timeseries(conn, entities["drive_mode"], start_ts=cutoff_ts)
             if "drive_mode" in entities
@@ -1101,12 +1156,7 @@ def reconstruct_drives_from_sqlite(
 
             distance_mi = 0.0
             if start_odo is not None and end_odo is not None:
-                delta_odo = end_odo - start_odo
-                # Check if odometer was in meters (> 10000 and delta > 100)
-                if start_odo > 50000.0 and delta_odo > 50.0:
-                    distance_mi = round(delta_odo / METERS_PER_MILE, 2)
-                else:
-                    distance_mi = round(max(0.0, delta_odo), 2)
+                distance_mi = _odo_delta_miles(start_odo, end_odo, odo_unit_known)
 
             # Battery SOC and energy
             start_soc = _get_value_at_ts(soc_series, start_ts, prefer="nearest") or 0.0
@@ -1177,11 +1227,7 @@ def reconstruct_drives_from_sqlite(
                 s_odo = _get_value_at_ts(odometer_series, t_curr, prefer="nearest")
                 e_odo = _get_value_at_ts(odometer_series, t_next, prefer="nearest")
                 if s_odo is not None and e_odo is not None:
-                    d_odo = e_odo - s_odo
-                    if s_odo > 50000.0 and d_odo > 50.0:
-                        chunk_dist = round(d_odo / METERS_PER_MILE, 2)
-                    else:
-                        chunk_dist = round(max(0.0, d_odo), 2)
+                    chunk_dist = _odo_delta_miles(s_odo, e_odo, odo_unit_known)
                 else:
                     chunk_dist = 0.0
 
@@ -1224,18 +1270,10 @@ def reconstruct_drives_from_sqlite(
                 t_curr = t_next
 
             # Vehicle-context fields for this drive's window.
-            start_range_km = _get_value_at_ts(range_series, start_ts, prefer="nearest")
-            end_range_km = _get_value_at_ts(range_series, end_ts, prefer="nearest")
-            start_range_mi = (
-                round(start_range_km * KM_TO_MILES, 1)
-                if start_range_km is not None
-                else None
-            )
-            end_range_mi = (
-                round(end_range_km * KM_TO_MILES, 1)
-                if end_range_km is not None
-                else None
-            )
+            start_range = _get_value_at_ts(range_series, start_ts, prefer="nearest")
+            end_range = _get_value_at_ts(range_series, end_ts, prefer="nearest")
+            start_range_mi = round(start_range, 1) if start_range is not None else None
+            end_range_mi = round(end_range, 1) if end_range is not None else None
 
             modes_in_window = [
                 s for t, s in drive_mode_raw_series if start_ts <= t <= end_ts
@@ -1340,9 +1378,7 @@ def reconstruct_dcfc_sessions_from_sqlite(
         return []
 
     cursor = conn.cursor()
-    cursor.execute("PRAGMA table_info(states)")
-    columns = [row["name"] for row in cursor.fetchall()]
-    ts_col = "last_updated_ts" if "last_updated_ts" in columns else "last_updated"
+    ts_col = _states_ts_col(conn)
 
     charging_windows: list[tuple[float, float]] = []
     if status_id:
@@ -1357,14 +1393,9 @@ def reconstruct_dcfc_sessions_from_sqlite(
         cur_end = None
         for r in cursor.fetchall():
             st = str(r["state"]).lower()
-            raw_ts = r[ts_col]
-            ts = (
-                float(raw_ts)
-                if isinstance(raw_ts, (int, float))
-                else datetime.fromisoformat(
-                    str(raw_ts).replace("Z", "+00:00")
-                ).timestamp()
-            )
+            ts = _row_ts(r[ts_col])
+            if ts is None:
+                continue
             if st in ("on", "true", "charging_active", "charging_connecting"):
                 if cur_start is None:
                     cur_start = ts
@@ -1416,15 +1447,8 @@ def reconstruct_dcfc_sessions_from_sqlite(
                 continue
             try:
                 val = float(val_str)
-                if 0.0 < val < 99.5:
-                    raw_ts = sr[ts_col]
-                    ts = (
-                        float(raw_ts)
-                        if isinstance(raw_ts, (int, float))
-                        else datetime.fromisoformat(
-                            str(raw_ts).replace("Z", "+00:00")
-                        ).timestamp()
-                    )
+                ts = _row_ts(sr[ts_col])
+                if ts is not None and 0.0 < val < 99.5:
                     raw_soc.append((ts, val))
             except (ValueError, TypeError):
                 continue
@@ -1821,7 +1845,14 @@ async def async_backfill_from_recorder(
             await target_store.async_save_dcfc_sessions(dcfc_sessions)
 
         if hass is not None and vin:
-            await async_update_statistics(hass, vin, drives)
+            # Backfilled drives are usually older than the stored statistics,
+            # so appending them would restart the running sums. Recompute
+            # every hour from the earliest new drive on instead.
+            starts = [
+                ts for d in drives if (ts := _iso_to_ts(d.start_time)) is not None
+            ]
+            if starts:
+                await async_rewrite_statistics(hass, target_store, min(starts))
             hass.bus.async_fire(RIVIAN_ANALYTICS_UPDATED_EVENT, {"vin": vin})
 
     # GPS route rebuild for previously-stored drives that have no track yet.

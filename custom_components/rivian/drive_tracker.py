@@ -503,8 +503,12 @@ class DriveTracker:
                         drain_kwh=drain_kwh,
                         rate_pct_per_day=rate_pct_day,
                         avg_watts=avg_watts,
-                        latitude=self._park_lat or start_lat,
-                        longitude=self._park_lon or start_lon,
+                        latitude=self._park_lat
+                        if self._park_lat is not None
+                        else start_lat,
+                        longitude=self._park_lon
+                        if self._park_lon is not None
+                        else start_lon,
                     )
                     self._schedule_coro(self._async_record_vampire_event(v_record))
             self._park_start_dt = None
@@ -818,8 +822,11 @@ class DriveTracker:
         else:
             chunk_dist = 0.0
 
-        s_soc = active.get("current_chunk_start_soc") or (battery_soc or 0.0)
-        e_soc = battery_soc or s_soc
+        # `is not None`, not `or`: 0 % is a real reading.
+        s_soc = active.get("current_chunk_start_soc")
+        if s_soc is None:
+            s_soc = battery_soc if battery_soc is not None else 0.0
+        e_soc = battery_soc if battery_soc is not None else s_soc
         chunk_dsoc = max(0.0, s_soc - e_soc)
         bat_cap = active.get("battery_capacity_kwh", 135.0)
         chunk_kwh = (chunk_dsoc * bat_cap) / 100.0
@@ -833,7 +840,7 @@ class DriveTracker:
             chunk_avg_spd = 0.0
 
         s_alt = active.get("current_chunk_start_alt_m")
-        e_alt = altitude_m or s_alt
+        e_alt = altitude_m if altitude_m is not None else s_alt
         chunk_elev = (
             round((e_alt - s_alt) * METERS_TO_FEET, 1)
             if s_alt is not None and e_alt is not None

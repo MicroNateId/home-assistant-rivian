@@ -192,3 +192,16 @@ class TestAsyncClearStatistics:
         mock_hass.config.components = []
         # Must not raise, and must not touch recorder.get_instance.
         statistics_mod.async_clear_statistics(mock_hass, TEST_VIN)
+
+
+def test_half_hour_offset_start_buckets_by_utc_hour() -> None:
+    """A +05:30 start lands in its UTC hour, not a half-hour-misaligned one."""
+    from datetime import timedelta
+
+    ist = timezone(timedelta(hours=5, minutes=30))
+    # 10:15 +05:30 is 04:45 UTC -> the 04:00 UTC hour.
+    start = datetime(2026, 9, 1, 10, 15, tzinfo=ist)
+    buckets = statistics_mod._bucket_drives([_drive("d1", start, 5.0, 2.0)])
+
+    assert [b.start for b in buckets] == [_hour(2026, 9, 1, 4)]
+    assert buckets[0].start.utcoffset() == timedelta(0)
