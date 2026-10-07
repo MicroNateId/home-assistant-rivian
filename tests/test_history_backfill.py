@@ -1782,3 +1782,88 @@ class TestTrackSpeedFallback:
         # 6 mi in 10 min is 36 mph on average; the lone 35 mph reading is ignored.
         assert drive.max_speed_mph == pytest.approx(36.0, abs=0.1)
         assert drive.speed_bins["30-39"].miles == pytest.approx(6.0, abs=0.01)
+
+
+class TestPositionSpikes:
+    """A location flipping out to one stale position and back is dropped."""
+
+    T0 = 1790000000.0
+
+    @staticmethod
+    def _path(n: int = 120) -> list[tuple[float, float, float]]:
+        # Due south at ~25 m/s, a fix every 10 s (~30 km in all).
+        return [(i * 10.0, 40.75 - i * 0.00225, -111.89) for i in range(n)]
+
+    def test_stale_point_fan_is_removed(self) -> None:
+        path = self._path()
+        stale = path[0][1:]
+        fan = []
+        for t, lat, lon in path:
+            fan.append((t, lat, lon))
+            fan.append((t + 5.0, *stale))  # the stuck position, resent between fixes
+
+        kept = history_backfill._drop_position_spikes(fan)
+
+        # Only stale copies within ~500 m of the start survive (they're real there).
+        assert [p for p in kept if p[1:] != stale] == path[1:]
+        assert sum(1 for p in kept if p[1:] == stale) <= 4
+        # No more 130 mph jumps; a copy identical to the real start fix only
+        # nudges the first estimate.
+        speeds = [s for s in history_backfill._gps_speeds(kept) if s is not None]
+        assert max(speeds) < 40.0
+        assert sorted(speeds)[len(speeds) // 2] == pytest.approx(25.0, abs=0.1)
+
+    def test_repeated_stale_fixes_are_one_spike(self) -> None:
+        path = self._path(20)
+        far = (path[10][0] + 3.0, 41.5, -111.89)  # 80 km away, resent twice
+        fixes = [*path[:11], far, (far[0] + 1.0, far[1], far[2]), *path[11:]]
+
+        assert history_backfill._drop_position_spikes(fixes) == path
+
+    def test_real_turns_and_slow_detours_are_kept(self) -> None:
+        # South for 2 km, then east: a corner, not an out-and-back.
+        south = [(i * 10.0, 40.75 - i * 0.00225, -111.89) for i in range(10)]
+        east = [
+            (100.0 + i * 10.0, south[-1][1], -111.89 + i * 0.003) for i in range(1, 10)
+        ]
+        fixes = south + east
+        assert history_backfill._drop_position_spikes(fixes) == fixes
+
+    def test_null_island_glitch_is_dropped(self) -> None:
+        path = self._path(10)
+        fixes = [*path[:5], (path[4][0] + 2.0, 0.0, 0.0), *path[5:]]
+        assert history_backfill._drop_position_spikes(fixes) == path
+
+    def test_rebuilt_route_has_no_fan(
+        self, tmp_path: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        db_path = str(tmp_path / "recorder.db")
+        _build_lookalike_recorder_db(db_path, self.T0)
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        # Interleave the drive's start position (stuck) into the car's tracker
+        # history once it has driven well away from it.
+        for i in range(60, 121):
+            cur.execute(
+                "INSERT INTO state_attributes (shared_attrs) VALUES (?)",
+                (json.dumps({"latitude": 40.60, "longitude": -111.60}),),
+            )
+            cur.execute(
+                "INSERT INTO states (metadata_id, state, attributes_id, "
+                "last_updated_ts) VALUES (7, 'not_home', ?, ?)",
+                (cur.lastrowid, self.T0 + i * 5.0 + 2.5),
+            )
+        conn.commit()
+        conn.close()
+
+        with caplog.at_level("INFO"):
+            tracks = reconstruct_tracks_for_windows(
+                db_path,
+                TestRegistryFirstResolution.CAR_IDS,
+                [("d1", self.T0, self.T0 + 600.0)],
+            )
+
+        pts = tracks["d1"].points
+        assert len(pts) == 121
+        assert all(p.lat != 40.60 or p.lon != -111.60 for p in pts[1:])
+        assert "61 location spikes dropped" in caplog.text

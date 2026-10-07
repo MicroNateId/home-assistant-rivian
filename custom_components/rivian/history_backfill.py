@@ -62,6 +62,18 @@ GPS_SPEED_MAX_MPS: Final[float] = 60.0
 # is about one reading per this many seconds; sparser history (a sensor the
 # recorder mostly missed) falls back to the drive's average speed.
 DRIVE_SPEED_MIN_COVERAGE_S: Final[float] = 120.0
+# Location spikes. Some recorders hold a location that keeps flipping out to
+# one stale position and back (Rivian can resend an old gnssLocation). A fix
+# is dropped when it returns to an exact earlier position more than
+# SPIKE_RETURN_MIN_M from the last kept fix (a real car never comes back to
+# the exact same coordinates), when both reaching it and leaving it would take
+# more than SPIKE_MAX_MPS, or when it sits more than SPIKE_MIN_DETOUR_M from
+# both neighbours and going out to it and back is over SPIKE_DETOUR_RATIO
+# times the direct distance (an out-and-back no car drives between two fixes).
+SPIKE_RETURN_MIN_M: Final[float] = 150.0
+SPIKE_MAX_MPS: Final[float] = 70.0
+SPIKE_MIN_DETOUR_M: Final[float] = 500.0
+SPIKE_DETOUR_RATIO: Final[float] = 3.0
 
 # Recorder entity_id -> (entity registry domain, unique_id suffix) for the
 # fields a GPS track needs, matching the unique_id scheme in entity.py
@@ -498,6 +510,52 @@ def _value_near(
     return best[1] if best is not None else None
 
 
+def _drop_position_spikes(
+    fixes: list[tuple[float, float, float]],
+) -> list[tuple[float, float, float]]:
+    """Remove stale-position flip-backs and out-and-back glitches from fixes.
+
+    ``fixes`` are ``(t, lat, lon)`` in time order. A run of identical fixes is
+    judged as one: its neighbours are the last kept fix before it and the
+    first fix after it at a different position, so a stale position resent
+    several times in a row is still caught.
+    """
+    kept: list[tuple[float, float, float]] = []
+    seen: set[tuple[float, float]] = set()
+    i = 0
+    n = len(fixes)
+    while i < n:
+        t, lat, lon = fixes[i]
+        j = i + 1
+        while j < n and (fixes[j][1], fixes[j][2]) == (lat, lon):
+            j += 1
+        spike = False
+        if kept:
+            pt, plat, plon = kept[-1]
+            out = haversine_m(plat, plon, lat, lon)
+            if (lat, lon) in seen and out > SPIKE_RETURN_MIN_M:
+                spike = True
+            elif j < n and out > SPIKE_MIN_DETOUR_M:
+                nt, nlat, nlon = fixes[j]
+                back = haversine_m(lat, lon, nlat, nlon)
+                direct = haversine_m(plat, plon, nlat, nlon)
+                too_fast = (
+                    t > pt
+                    and nt > fixes[j - 1][0]
+                    and out / (t - pt) > SPIKE_MAX_MPS
+                    and back / (nt - fixes[j - 1][0]) > SPIKE_MAX_MPS
+                )
+                detour = back > SPIKE_MIN_DETOUR_M and (
+                    out + back > SPIKE_DETOUR_RATIO * direct + SPIKE_MIN_DETOUR_M
+                )
+                spike = too_fast or detour
+        if not spike:
+            kept.extend(fixes[i:j])
+            seen.add((lat, lon))
+        i = j
+    return kept
+
+
 def _gps_speeds(points: list[tuple[float, float, float]]) -> list[float | None]:
     """Estimate each fix's speed (m/s) from its neighbouring fixes.
 
@@ -893,6 +951,7 @@ def reconstruct_tracks_for_windows(
         results: dict[str, DriveTrack] = {}
         too_few_fixes = 0
         gps_speed_tracks = 0
+        spikes_dropped = 0
         for drive_id, start_ts, end_ts in windows:
             w_start = start_ts - TRACK_WINDOW_PAD_SECONDS
             w_end = end_ts + TRACK_WINDOW_PAD_SECONDS
@@ -908,7 +967,9 @@ def reconstruct_tracks_for_windows(
             win_soc = [(t, v) for t, v in soc_series if w_start <= t <= w_end]
             win_odo = [(t, v) for t, v in odo_series if w_start <= t <= w_end]
 
-            fixes = [(t, lat, lon) for (t, lat), (_t, lon) in zip(win_lat, win_lon)]
+            raw_fixes = [(t, lat, lon) for (t, lat), (_t, lon) in zip(win_lat, win_lon)]
+            fixes = _drop_position_spikes(raw_fixes)
+            spikes_dropped += len(raw_fixes) - len(fixes)
             gps_speeds = _gps_speeds(fixes)
             used_gps_speed = False
             track = DriveTrack()
@@ -954,7 +1015,8 @@ def reconstruct_tracks_for_windows(
         _LOGGER.info(
             "Rebuilt %d of %d routes from the recorder (%d with speed estimated "
             "from GPS positions, %d without speed, %d speed readings available); "
-            "%d drives have fewer than %d recorded locations and get no route",
+            "%d drives have fewer than %d recorded locations and get no route; "
+            "%d location spikes dropped",
             len(results),
             len(windows),
             gps_speed_tracks,
@@ -962,6 +1024,7 @@ def reconstruct_tracks_for_windows(
             len(speed_series),
             too_few_fixes,
             MIN_TRACK_POINTS,
+            spikes_dropped,
         )
         if gps_speed_tracks and gps_speed_tracks * 2 >= len(results):
             _LOGGER.warning(
