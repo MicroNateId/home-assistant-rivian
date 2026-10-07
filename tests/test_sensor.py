@@ -1093,7 +1093,9 @@ class TestIntegrationLifecycle:
         # Patch DriveStore so __init__.py's real (per-instance) AnalyticsDatabase
         # wiring is swapped for this test's isolated tmp-path database, keeping
         # this test independent of the shared HA storage directory.
-        def _drive_store_factory(*, hass: Any, vin: str, db: Any = None) -> DriveStore:
+        def _drive_store_factory(
+            *, hass: Any, vin: str, db: Any = None, place_geocoding: bool = True
+        ) -> DriveStore:
             return DriveStore(hass, vin, analytics_db)
 
         with (
@@ -1174,7 +1176,9 @@ class TestIntegrationLifecycle:
         mock_hass.config_entries.async_forward_entry_setups = AsyncMock()
         mock_hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
 
-        def _drive_store_factory(*, hass: Any, vin: str, db: Any = None) -> DriveStore:
+        def _drive_store_factory(
+            *, hass: Any, vin: str, db: Any = None, place_geocoding: bool = True
+        ) -> DriveStore:
             return DriveStore(hass, vin, analytics_db)
 
         with (
@@ -1262,7 +1266,9 @@ class TestIntegrationLifecycle:
         mock_hass.config_entries.async_forward_entry_setups = AsyncMock()
         mock_hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
 
-        def _drive_store_factory(*, hass: Any, vin: str, db: Any = None) -> DriveStore:
+        def _drive_store_factory(
+            *, hass: Any, vin: str, db: Any = None, place_geocoding: bool = True
+        ) -> DriveStore:
             return DriveStore(hass, vin, analytics_db)
 
         with (
@@ -1349,7 +1355,9 @@ class TestIntegrationLifecycle:
         mock_hass.config_entries.async_forward_entry_setups = AsyncMock()
         mock_hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
 
-        def _drive_store_factory(*, hass: Any, vin: str, db: Any = None) -> DriveStore:
+        def _drive_store_factory(
+            *, hass: Any, vin: str, db: Any = None, place_geocoding: bool = True
+        ) -> DriveStore:
             return DriveStore(hass, vin, analytics_db)
 
         with (
@@ -1437,7 +1445,9 @@ class TestIntegrationLifecycle:
         mock_hass.config_entries.async_forward_entry_setups = AsyncMock()
         mock_hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
 
-        def _drive_store_factory(*, hass: Any, vin: str, db: Any = None) -> DriveStore:
+        def _drive_store_factory(
+            *, hass: Any, vin: str, db: Any = None, place_geocoding: bool = True
+        ) -> DriveStore:
             return DriveStore(hass, vin, analytics_db)
 
         with (
