@@ -44,6 +44,8 @@ from .const import (
     ATTR_ANALYTICS_DB,
     ATTR_API,
     ATTR_COORDINATOR,
+    ATTR_DEMO_STORES,
+    ATTR_DEMO_VEHICLES,
     ATTR_DRIVE_STORE,
     ATTR_DRIVE_TRACKER,
     ATTR_USER,
@@ -82,6 +84,13 @@ from .dashboard_generator import (
     DEFAULT_URL_PATH,
     async_create_efficiency_dashboard,
 )
+from .demo import (
+    async_install_demo,
+    async_remove_demo,
+    async_setup_demo_registry,
+    async_teardown_demo_registry,
+    is_demo_vin,
+)
 from .drive_storage import DriveStore, read_zone_states
 from .drive_tracker import DriveEvent, DriveTracker
 from .helpers import get_rivian_api_from_entry
@@ -103,6 +112,8 @@ SERVICE_REBUILD_PLACES = "rebuild_places"
 SERVICE_REBUILD_ROUTES = "rebuild_routes"
 SERVICE_IMPORT_CHARGING_HISTORY = "import_charging_history"
 SERVICE_INFER_CHARGING_SESSIONS = "infer_charging_sessions"
+SERVICE_CREATE_DEMO_DATA = "create_demo_data"
+SERVICE_DELETE_DEMO_DATA = "delete_demo_data"
 
 # Special (non-config-entry) keys stored directly under hass.data[DOMAIN].
 _ANALYTICS_DB_LOCK_KEY: Final = "_analytics_db_lock"
@@ -112,6 +123,8 @@ _DASHBOARD_AUTOCREATE_KEY: Final = "_dashboard_autocreate_claimed"
 _SPECIAL_DOMAIN_DATA_KEYS: Final = frozenset(
     {
         ATTR_ANALYTICS_DB,
+        ATTR_DEMO_STORES,
+        ATTR_DEMO_VEHICLES,
         _ANALYTICS_DB_LOCK_KEY,
         "_ws_api_registered",
         _ZONE_LISTENER_REGISTERED_KEY,
@@ -227,6 +240,14 @@ REBUILD_PLACES_SERVICE_SCHEMA = vol.Schema(
 )
 
 REBUILD_ROUTES_SERVICE_SCHEMA = vol.Schema(
+    {
+        vol.Optional("vin"): cv.string,
+    }
+)
+
+CREATE_DEMO_DATA_SERVICE_SCHEMA = vol.Schema({})
+
+DELETE_DEMO_DATA_SERVICE_SCHEMA = vol.Schema(
     {
         vol.Optional("vin"): cv.string,
     }
@@ -625,7 +646,7 @@ def _async_register_zone_listener(hass: HomeAssistant) -> None:
     async def _resync_all_zones(_now: Any = None) -> None:
         zones = read_zone_states(hass)
         # Places are shared by every vehicle, so the zones sync once for the
-        # real dataset, not once per store.
+        # real dataset (never the demo one), not once per store.
         stores = [
             store
             for entry_data in _iter_entry_datas(hass)
@@ -769,7 +790,7 @@ async def _async_charging_history_job(
 ) -> dict[str, Any]:
     """Import the Rivian app's charging history and refresh the capacity history.
 
-    Real vehicles only. ``force`` skips the
+    Real vehicles only: demo vehicles are never imported. ``force`` skips the
     once-a-day guard (the ``rivian.import_charging_history`` service).
     """
     stores: dict[str, DriveStore] = entry_data.get(ATTR_DRIVE_STORE) or {}
@@ -778,7 +799,10 @@ async def _async_charging_history_job(
     vins_by_id = {
         vehicle_id: str(info["vin"])
         for vehicle_id, info in vehicles.items()
-        if info.get("vin") and vehicle_id in stores
+        if info.get("vin")
+        and vehicle_id in stores
+        and not stores[vehicle_id].is_demo
+        and not is_demo_vin(hass, str(info["vin"]))
     }
     if not vins_by_id:
         return {"vehicles": {}}
@@ -862,6 +886,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     analytics_db = await _async_get_or_create_analytics_db(hass)
     _async_check_analytics_db_issues(hass, analytics_db)
+    await async_setup_demo_registry(hass, analytics_db)
 
     client = get_rivian_api_from_entry(hass, entry)
     try:
@@ -1155,7 +1180,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         Add-only: fills only the still-empty condition columns (and the
         energy model's expected kWh) of stored routed drives from the
-        Open-Meteo archive, rate-limited.
+        Open-Meteo archive, rate-limited. Demo vehicles are skipped.
         """
         vin = call.data.get("vin")
         days = call.data.get("days", 365)
@@ -1163,7 +1188,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             store
             for entry_data in _iter_entry_datas(hass)
             for store in (entry_data.get(ATTR_DRIVE_STORE) or {}).values()
-            if (vin is None or store.vin == vin)
+            if (vin is None or store.vin == vin) and not store.is_demo
         ]
         if not targets:
             raise HomeAssistantError(
@@ -1260,7 +1285,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             store
             for entry_data in _iter_entry_datas(hass)
             for store in (entry_data.get(ATTR_DRIVE_STORE) or {}).values()
-            if (vin is None or store.vin == vin)
+            if (vin is None or store.vin == vin) and not store.is_demo
         ]
         if not targets:
             raise HomeAssistantError(
@@ -1391,6 +1416,34 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             schema=REBUILD_ROUTES_SERVICE_SCHEMA,
         )
 
+    async def async_handle_create_demo_data(call: ServiceCall) -> None:
+        """Install (or replace) the synthetic Eagle, ID demo vehicles. Admin only."""
+        installed = await async_install_demo(hass)
+        _LOGGER.info("Installed demo vehicles: %s", installed)
+
+    async def async_handle_delete_demo_data(call: ServiceCall) -> None:
+        """Remove the demo vehicles (or one by VIN) completely. Admin only."""
+        removed = await async_remove_demo(hass, call.data.get("vin"))
+        _LOGGER.info("Removed demo vehicles: %s", removed)
+
+    if not hass.services.has_service(DOMAIN, SERVICE_CREATE_DEMO_DATA):
+        async_register_admin_service(
+            hass,
+            DOMAIN,
+            SERVICE_CREATE_DEMO_DATA,
+            async_handle_create_demo_data,
+            schema=CREATE_DEMO_DATA_SERVICE_SCHEMA,
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_DELETE_DEMO_DATA):
+        async_register_admin_service(
+            hass,
+            DOMAIN,
+            SERVICE_DELETE_DEMO_DATA,
+            async_handle_delete_demo_data,
+            schema=DELETE_DEMO_DATA_SERVICE_SCHEMA,
+        )
+
     async_register_websocket_api(hass)
     await _async_register_frontend(hass)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -1462,6 +1515,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.services.async_remove(DOMAIN, SERVICE_IMPORT_CHARGING_HISTORY)
         if hass.services.has_service(DOMAIN, SERVICE_INFER_CHARGING_SESSIONS):
             hass.services.async_remove(DOMAIN, SERVICE_INFER_CHARGING_SESSIONS)
+        for demo_service in (SERVICE_CREATE_DEMO_DATA, SERVICE_DELETE_DEMO_DATA):
+            if hass.services.has_service(DOMAIN, demo_service):
+                hass.services.async_remove(DOMAIN, demo_service)
+        async_teardown_demo_registry(hass)
 
         domain_data = hass.data.get(DOMAIN, {})
         db: AnalyticsDatabase | None = domain_data.pop(ATTR_ANALYTICS_DB, None)
