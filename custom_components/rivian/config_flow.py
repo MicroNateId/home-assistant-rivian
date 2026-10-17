@@ -24,11 +24,15 @@ from homeassistant.helpers.schema_config_entry_flow import (
     SchemaOptionsFlowHandler,
 )
 from homeassistant.helpers.selector import (
+    BooleanSelector,
     DeviceFilterSelectorConfig,
     DeviceSelector,
     DeviceSelectorConfig,
     EntitySelector,
     EntitySelectorConfig,
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
@@ -36,6 +40,7 @@ from homeassistant.helpers.selector import (
 
 from .const import (
     CONF_ACCESS_TOKEN,
+    CONF_MFA_VERIFIED,
     CONF_OTP,
     CONF_REFRESH_TOKEN,
     CONF_USER_SESSION_TOKEN,
@@ -47,14 +52,40 @@ from .const import (
     IMAGE_STYLE_PHOTO,
 )
 from .coordinator import UserCoordinator
-from .helpers import get_rivian_api_from_entry
+from .helpers import get_rivian_api_from_entry, has_verified_2fa
 
 _LOGGER = logging.getLogger(__name__)
 
 
+# Number of days of drive/vampire-drain/DCFC history the analytics database keeps
+# before pruning; 0 means keep forever. __init__.py imports the option names
+# below from this module.
+CONF_ANALYTICS_RETENTION_DAYS = "analytics_retention_days"
+DEFAULT_ANALYTICS_RETENTION_DAYS = 365
+ANALYTICS_RETENTION_DAYS_MIN = 0
+ANALYTICS_RETENTION_DAYS_MAX = 3650
+
+# GPS route (drive_tracks) storage options.
+CONF_TRACK_CAPTURE = "track_capture"
+DEFAULT_TRACK_CAPTURE = True
+CONF_TRACK_RETENTION_DAYS = "track_retention_days"
+DEFAULT_TRACK_RETENTION_DAYS = 365  # 0 = keep as long as the drive itself
+TRACK_RETENTION_DAYS_MIN = 0
+TRACK_RETENTION_DAYS_MAX = 3650
+CONF_TRACK_FULL_DETAIL_DAYS = "track_full_detail_days"
+DEFAULT_TRACK_FULL_DETAIL_DAYS = 0  # 0 = never thin
+TRACK_FULL_DETAIL_DAYS_MIN = 0
+TRACK_FULL_DETAIL_DAYS_MAX = 3650
+
+# Whether drives get weather (temperature, wind, rain) from the public
+# Open-Meteo API.
+CONF_WEATHER_LOOKUPS = "weather_lookups"
+DEFAULT_WEATHER_LOOKUPS = True
+
 STEP_OTP_DATA_SCHEMA = vol.Schema({vol.Required(CONF_OTP): str})
 R1S = DeviceFilterSelectorConfig(integration=DOMAIN, manufacturer="Rivian", model="R1S")
 R1T = DeviceFilterSelectorConfig(integration=DOMAIN, manufacturer="Rivian", model="R1T")
+R2 = DeviceFilterSelectorConfig(integration=DOMAIN, manufacturer="Rivian", model="R2")
 OPTIONS_SCHEMA = vol.Schema(
     {
         vol.Optional(CONF_VEHICLE_IMAGE_STYLE, default=IMAGE_STYLE_CEL): SelectSelector(
@@ -65,11 +96,47 @@ OPTIONS_SCHEMA = vol.Schema(
             )
         ),
         vol.Optional(CONF_VEHICLE_CONTROL): DeviceSelector(
-            DeviceSelectorConfig(multiple=True, filter=[R1S, R1T])
+            DeviceSelectorConfig(multiple=True, filter=[R1S, R1T, R2])
         ),
         vol.Optional(CONF_ZONE): EntitySelector(
             EntitySelectorConfig(domain=ZONE_DOMAIN, multiple=True)
         ),
+        vol.Optional(
+            CONF_ANALYTICS_RETENTION_DAYS, default=DEFAULT_ANALYTICS_RETENTION_DAYS
+        ): NumberSelector(
+            NumberSelectorConfig(
+                min=ANALYTICS_RETENTION_DAYS_MIN,
+                max=ANALYTICS_RETENTION_DAYS_MAX,
+                step=1,
+                mode=NumberSelectorMode.BOX,
+            )
+        ),
+        vol.Optional(
+            CONF_TRACK_CAPTURE, default=DEFAULT_TRACK_CAPTURE
+        ): BooleanSelector(),
+        vol.Optional(
+            CONF_TRACK_RETENTION_DAYS, default=DEFAULT_TRACK_RETENTION_DAYS
+        ): NumberSelector(
+            NumberSelectorConfig(
+                min=TRACK_RETENTION_DAYS_MIN,
+                max=TRACK_RETENTION_DAYS_MAX,
+                step=1,
+                mode=NumberSelectorMode.BOX,
+            )
+        ),
+        vol.Optional(
+            CONF_TRACK_FULL_DETAIL_DAYS, default=DEFAULT_TRACK_FULL_DETAIL_DAYS
+        ): NumberSelector(
+            NumberSelectorConfig(
+                min=TRACK_FULL_DETAIL_DAYS_MIN,
+                max=TRACK_FULL_DETAIL_DAYS_MAX,
+                step=1,
+                mode=NumberSelectorMode.BOX,
+            )
+        ),
+        vol.Optional(
+            CONF_WEATHER_LOOKUPS, default=DEFAULT_WEATHER_LOOKUPS
+        ): BooleanSelector(),
     }
 )
 
@@ -89,10 +156,6 @@ async def validate_vehicle_control(
     vehicles = user.get_vehicles()
     vehicle_control = user_input.get(CONF_VEHICLE_CONTROL, [])
     device_registry = dr.async_get(hass)
-
-    if vehicle_control and not user.data.get("registrationChannels"):
-        await api.close()
-        raise SchemaFlowError("2fa_missing")
 
     if vehicle_control and not entry.options.get("private_key"):
         public_key, private_key = generate_key_pair()
@@ -115,6 +178,14 @@ async def validate_vehicle_control(
         }
     else:
         control_vehicles = {}
+
+    # Enrolling a new phone key grants new access, so require 2FA first.
+    # Re-authenticating records it when Rivian asks for an OTP.
+    to_enroll = [v for v in control_vehicles if v not in vehicle_identity]
+    if to_enroll and not has_verified_2fa(entry, user.data):
+        await api.close()
+        entry.async_start_reauth(hass)
+        raise SchemaFlowError("2fa_unverified")
 
     for vehicle_id, vehicle in vehicles.items():
         vehicle_name = vehicle["name"]
@@ -193,6 +264,8 @@ class RivianFlowHandler(ConfigFlow, domain=DOMAIN):
     """Config flow for Rivian"""
 
     VERSION = 1
+    # 2: enum sensor states are lowercase API values (see async_migrate_entry)
+    MINOR_VERSION = 2
 
     def __init__(self):
         """Initialize."""
@@ -204,6 +277,7 @@ class RivianFlowHandler(ConfigFlow, domain=DOMAIN):
         self._refresh_token = None
         self._session_token = None
         self._user_session_token = None
+        self._mfa_verified = False
 
     @property
     def rivian(self) -> Rivian:
@@ -248,6 +322,7 @@ class RivianFlowHandler(ConfigFlow, domain=DOMAIN):
                 return await self._show_credential_fields(user_input)
 
             if self.rivian._access_token:
+                self._mfa_verified = True
                 self._access_token = self.rivian._access_token
                 self._refresh_token = self.rivian._refresh_token
                 self._user_session_token = self.rivian._user_session_token
@@ -289,6 +364,7 @@ class RivianFlowHandler(ConfigFlow, domain=DOMAIN):
             CONF_ACCESS_TOKEN: self._access_token,
             CONF_REFRESH_TOKEN: self._refresh_token,
             CONF_USER_SESSION_TOKEN: self._user_session_token,
+            CONF_MFA_VERIFIED: self._mfa_verified,
         }
 
         entry_id = self.context.get("entry_id")
