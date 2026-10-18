@@ -166,7 +166,11 @@ def _setup_mock_environment() -> None:
                 self.config.components = []
                 self.services = MockServiceRegistry()
                 self.bus = MagicMock()
+                # No zones configured by default; __init__.py's zone sync
+                # (read_zone_states) reads hass.states.async_all("zone") at
+                # setup and on every zone.* state change.
                 self.states = MagicMock()
+                self.states.async_all = MagicMock(return_value=[])
                 # Sentinel that never matches a real threading.get_ident() value,
                 # so AnalyticsDatabase's executor-thread guard never fires when
                 # tests call its (normally executor-bound) methods directly from
@@ -233,6 +237,7 @@ def _setup_mock_environment() -> None:
         const_mod.UnitOfElectricCurrent = DynamicEnum  # type: ignore[attr-defined]
         const_mod.UnitOfElectricPotential = DynamicEnum  # type: ignore[attr-defined]
         const_mod.UnitOfEnergy = DynamicEnum  # type: ignore[attr-defined]
+        const_mod.UnitOfEnergyDistance = DynamicEnum  # type: ignore[attr-defined]
         const_mod.UnitOfLength = DynamicEnum  # type: ignore[attr-defined]
         const_mod.UnitOfPower = DynamicEnum  # type: ignore[attr-defined]
         const_mod.UnitOfPressure = DynamicEnum  # type: ignore[attr-defined]
@@ -374,9 +379,15 @@ def _setup_mock_environment() -> None:
         helpers_mod.update_coordinator.CoordinatorEntity = (  # type: ignore[attr-defined]
             MockCoordinatorEntity
         )
-        helpers_mod.update_coordinator.UpdateFailed = type(
-            "UpdateFailed", (Exception,), {}
-        )  # type: ignore[attr-defined]
+
+        class UpdateFailed(Exception):
+            """Mock UpdateFailed, with its retry_after."""
+
+            def __init__(self, *args: Any, retry_after: float | None = None) -> None:
+                super().__init__(*args)
+                self.retry_after = retry_after
+
+        helpers_mod.update_coordinator.UpdateFailed = UpdateFailed  # type: ignore[attr-defined]
 
         helpers_mod.aiohttp_client = DynamicModule(
             "homeassistant.helpers.aiohttp_client", is_package=False
@@ -593,6 +604,35 @@ def _setup_mock_environment() -> None:
         sys.modules["homeassistant.components.diagnostics.util"] = diag_util_mod
         comp_mod.diagnostics = diag_mod
 
+        # repairs: a confirm flow like Home Assistant's, without the flow manager
+        repairs_mod = DynamicModule(
+            "homeassistant.components.repairs", is_package=False
+        )
+
+        class RepairsFlow:
+            """Mock RepairsFlow."""
+
+        class ConfirmRepairFlow(RepairsFlow):
+            """Mock ConfirmRepairFlow."""
+
+            async def async_step_init(
+                self, user_input: dict[str, str] | None = None
+            ) -> dict[str, Any]:
+                return await self.async_step_confirm()
+
+            async def async_step_confirm(
+                self, user_input: dict[str, str] | None = None
+            ) -> dict[str, Any]:
+                if user_input is not None:
+                    return {"type": "create_entry", "data": {}}
+                return {"type": "form", "step_id": "confirm"}
+
+        repairs_mod.RepairsFlow = RepairsFlow  # type: ignore[attr-defined]
+        repairs_mod.ConfirmRepairFlow = ConfirmRepairFlow  # type: ignore[attr-defined]
+        repairs_mod.RepairsFlowResult = dict  # type: ignore[attr-defined]
+        sys.modules["homeassistant.components.repairs"] = repairs_mod
+        comp_mod.repairs = repairs_mod
+
         # Entity descriptions for platforms
         @dataclass(kw_only=True)
         class SensorEntityDescription(EntityDescription):
@@ -745,6 +785,9 @@ def _setup_mock_environment() -> None:
         dt_mod.parse_datetime = _parse_datetime  # type: ignore[attr-defined]
         dt_mod.utc_from_timestamp = _utc_from_timestamp  # type: ignore[attr-defined]
         dt_mod.utcnow = _utcnow  # type: ignore[attr-defined]
+        # Backs websocket_api.py's calendar/day handlers, which resolve HA's
+        # configured zone on the event loop before handing it to the executor.
+        dt_mod.get_default_time_zone = lambda: UTC  # type: ignore[attr-defined]
         sys.modules["homeassistant.util.dt"] = dt_mod
         util_mod.dt = dt_mod  # type: ignore[attr-defined]
 
@@ -810,6 +853,12 @@ def _setup_mock_environment() -> None:
         rivian_mod.utils = utils_submod  # type: ignore[attr-defined]
         sys.modules["rivian.utils"] = utils_submod
 
+        # coordinator.py imports the Parallax decoder; tests patch it as needed
+        parallax_submod = DynamicModule("rivian.parallax", is_package=False)
+        parallax_submod.decode_parallax_message = MagicMock(return_value=None)  # type: ignore[attr-defined]
+        rivian_mod.parallax = parallax_submod  # type: ignore[attr-defined]
+        sys.modules["rivian.parallax"] = parallax_submod
+
 
 _setup_mock_environment()
 
@@ -851,3 +900,38 @@ def mock_config_entry() -> MagicMock:
     entry.add_update_listener = MagicMock()
     entry.async_on_unload = MagicMock()
     return entry
+
+
+@pytest.fixture
+def analytics_db_path(tmp_path: Any) -> str:
+    """Provide a per-test SQLite analytics database file path under tmp_path.
+
+    A real file path (not ``:memory:``) is required for tests that construct
+    multiple DriveStore/AnalyticsDatabase instances against the same
+    underlying database (persistence tests) or that need to inspect the file
+    on disk (migration/idempotency tests).
+    """
+    return str(tmp_path / "rivian_analytics_test.db")
+
+
+def make_analytics_db(hass: Any, db_path: str) -> Any:
+    """Construct and synchronously set up an AnalyticsDatabase for tests.
+
+    ``setup()`` is executor-bound in production, but is safe to call directly
+    here because the mock hass's ``loop_thread_id`` sentinel (-1) never
+    matches the test thread's real id, so the executor-thread guard does not
+    fire.
+    """
+    from custom_components.rivian.analytics_db import AnalyticsDatabase
+
+    db = AnalyticsDatabase(hass, db_path=db_path)
+    db.setup()
+    return db
+
+
+@pytest.fixture
+def analytics_db(mock_hass: Any, analytics_db_path: str) -> Any:
+    """Provide a ready (schema-initialized) AnalyticsDatabase for tests."""
+    db = make_analytics_db(mock_hass, analytics_db_path)
+    yield db
+    db.close()
