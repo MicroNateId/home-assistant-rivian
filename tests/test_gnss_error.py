@@ -117,7 +117,7 @@ def test_newer_navigation_fix(coor: coordinator.VehicleCoordinator) -> None:
 def test_newer_graphql_position(coor: coordinator.VehicleCoordinator) -> None:
     """A newer GraphQL position has no error, but speed and bearing keep theirs."""
     gnss_fix(coor, T0)
-    coor._process_graphql_location(
+    coor._process_graphql_position(
         {
             "type": "next",
             "payload": {
